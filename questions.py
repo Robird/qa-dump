@@ -3,14 +3,13 @@ import logging
 from api import LLMClient
 from models import (
     Checkpoint,
-    KnowledgeNode,
     Phase,
     QuestionItem,
     QuestionSet,
     collect_leaves,
     get_node_by_path,
+    make_question_id,
 )
-from prompts import get_prompts
 from storage import StorageManager
 
 logger = logging.getLogger(__name__)
@@ -71,6 +70,7 @@ class QuestionGenerator:
                     "question_id": q.id,
                     "node_path": path_str,
                     "text": q.text,
+                    "bloom_level": q.bloom_level,
                 })
 
             self.cp.leaf_queue.pop(0)
@@ -90,7 +90,7 @@ class QuestionGenerator:
         items = []
         for i, q_data in enumerate(result.get("questions", [])):
             items.append(QuestionItem(
-                id=f"q{i + 1:04d}",
+                id=make_question_id(node_path, i + 1),
                 text=q_data.get("text", ""),
                 bloom_level=self._normalize_bloom(q_data.get("bloom_level", "")),
                 node_path=node_path,

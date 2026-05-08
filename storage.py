@@ -81,3 +81,9 @@ class StorageManager:
     def write_answer(self, path_segments: list[str], answer: AnswerItem) -> None:
         d = self.answers_dir(path_segments)
         _atomic_write(d / f"{answer.question_id}.json", answer.model_dump_json(indent=2, ensure_ascii=False))
+
+    def read_answer(self, path_segments: list[str], question_id: str) -> AnswerItem:
+        raw = json.loads(
+            (self.node_dir(path_segments) / "answers" / f"{question_id}.json").read_text(encoding="utf-8")
+        )
+        return AnswerItem(**raw)

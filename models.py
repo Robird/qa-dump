@@ -43,7 +43,9 @@ class QuestionSet(BaseModel):
 
 class AnswerItem(BaseModel):
     question_id: str
+    question: str = ""
     answer: str
+    bloom_level: str = ""
     node_path: str = ""
 
 
@@ -89,3 +91,8 @@ def collect_leaves(node: KnowledgeNode, prefix: list[str]) -> list[list[str]]:
     for child in node.children:
         result.extend(collect_leaves(child, prefix + [child.slug]))
     return result
+
+
+def make_question_id(node_path: str, index: int) -> str:
+    prefix = node_path.replace("/", "__") if node_path else "root"
+    return f"{prefix}__q{index:04d}"

@@ -23,6 +23,7 @@ from typing import Optional
 from api import LLMClient
 from answers import AnswerGenerator
 from catalog import CatalogBuilder
+from exporter import DatasetExporter
 from models import Checkpoint, Phase, to_slug
 from prompts import get_prompts
 from questions import QuestionGenerator
@@ -51,6 +52,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir", default=None,
         help="Output directory (default: ./output/{lang})",
+    )
+    parser.add_argument(
+        "--run-id", default="",
+        help="Explicit run identifier used in exported sample IDs",
     )
     parser.add_argument(
         "--model-catalog", default="deepseek-v4-flash",
@@ -142,6 +147,36 @@ class MetaCheckpoint:
         os.replace(tmp, self.path)
 
 
+def atomic_write_json(path: str, payload: dict) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def resolve_run_id(args: argparse.Namespace, out_base: str) -> str:
+    if args.run_id:
+        return args.run_id
+    return os.path.basename(os.path.abspath(out_base.rstrip(os.sep))) or args.language
+
+
+def save_run_metadata(out_base: str, run_id: str, args: argparse.Namespace) -> None:
+    atomic_write_json(
+        os.path.join(out_base, "run.json"),
+        {
+            "run_id": run_id,
+            "output_dir": os.path.abspath(out_base),
+            "language": args.language,
+            "seed_domain": args.seed_domain,
+            "max_depth": args.max_depth,
+            "questions_per_node": args.questions_per_node,
+            "model_catalog": args.model_catalog,
+            "model_questions": args.model_questions,
+            "model_answers": args.model_answers,
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Per-domain pipeline (Phases 1–3)
 # ---------------------------------------------------------------------------
@@ -213,6 +248,19 @@ def run_domain(
     print(f"  Done — {seed_domain}")
 
 
+def export_domain_if_complete(
+    storage: StorageManager,
+    exporter: DatasetExporter,
+    language: str,
+) -> Optional[dict]:
+    checkpoint = storage.load_checkpoint()
+    if checkpoint is None or checkpoint.knowledge_tree is None:
+        return None
+    if checkpoint.phase != Phase.ANSWER_GENERATION or checkpoint.answer_queue:
+        return None
+    return exporter.export_domain(storage, checkpoint.knowledge_tree, language)
+
+
 # ---------------------------------------------------------------------------
 # Main orchestration
 # ---------------------------------------------------------------------------
@@ -221,6 +269,10 @@ def run(args: argparse.Namespace, base_url: str, api_key: str) -> None:
     lang = args.language
     out_base = args.output_dir or f"./output/{lang}"
     prompts = get_prompts(lang)
+    run_id = resolve_run_id(args, out_base)
+    os.makedirs(out_base, exist_ok=True)
+    save_run_metadata(out_base, run_id, args)
+    exporter = DatasetExporter(os.path.join(out_base, "exports"), run_id)
 
     # ---- Determine domains to process ----
     if args.seed_domain:
@@ -235,34 +287,46 @@ def run(args: argparse.Namespace, base_url: str, api_key: str) -> None:
 
     # Meta-checkpoint for domain-level progress
     meta_cp = MetaCheckpoint(os.path.join(out_base, ".meta_checkpoint.json"))
-    meta_state = meta_cp.load()
+    meta_state = meta_cp.load() if args.resume else {"domains": [], "done": []}
     done_slugs: set[str] = set(meta_state.get("done", []))
 
     # Persist discovered domains so resume doesn't need to re-discover
     if not args.seed_domain:
         meta_cp.save(domains, list(done_slugs))
 
+    domain_summaries: list[dict] = []
+
     # Process each domain
     for i, dom in enumerate(domains):
         slug = dom["slug"]
+        domain_output = os.path.join(out_base, slug)
+        storage = StorageManager(domain_output)
+        storage.setup()
+
         if slug in done_slugs:
             print(f"\n[{i + 1}/{len(domains)}] {dom['name']} — already done, skipping")
+            summary = export_domain_if_complete(storage, exporter, lang)
+            if summary is not None:
+                domain_summaries.append(summary)
             continue
 
         print(f"\n{'=' * 60}")
         print(f"[{i + 1}/{len(domains)}] {dom['name']}")
         print(f"{'=' * 60}")
 
-        domain_output = os.path.join(out_base, slug)
-        storage = StorageManager(domain_output)
-        storage.setup()
-
         run_domain(dom["name"], storage, prompts, args, base_url, api_key)
+        summary = export_domain_if_complete(storage, exporter, lang)
+        if summary is not None:
+            domain_summaries.append(summary)
 
         done_slugs.add(slug)
         meta_cp.save(domains, list(done_slugs))
 
+    exporter.export_run(domain_summaries, lang)
     print(f"\nAll done. Output: {os.path.abspath(out_base)}")
+    print(f"Run ID: {run_id}")
+    print(f"Dataset export: {os.path.abspath(os.path.join(out_base, 'exports', 'dataset.jsonl'))}")
+    print(f"Dataset manifest: {os.path.abspath(os.path.join(out_base, 'exports', 'manifest.json'))}")
 
 
 def main() -> None:
@@ -280,7 +344,10 @@ def main() -> None:
     def _on_sigint(signum, frame):
         print("\nInterrupted. Checkpoint saved. Resume with:", file=sys.stderr)
         out = args.output_dir or f"./output/{args.language}"
-        print(f"  python main.py --resume --output-dir {out} --language {args.language}", file=sys.stderr)
+        cmd = f"python main.py --resume --output-dir {out} --language {args.language}"
+        if args.run_id:
+            cmd += f" --run-id {args.run_id}"
+        print(f"  {cmd}", file=sys.stderr)
         sys.exit(1)
 
     signal.signal(signal.SIGINT, _on_sigint)

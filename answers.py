@@ -32,6 +32,7 @@ class AnswerGenerator:
             qid = entry["question_id"]
             path_str = entry.get("node_path", "")
             text = entry.get("text", "")
+            bloom_level = entry.get("bloom_level", "")
 
             if qid in done:
                 self.cp.answer_queue.pop(0)
@@ -47,7 +48,9 @@ class AnswerGenerator:
 
             answer = AnswerItem(
                 question_id=qid,
+                question=text,
                 answer=result.get("answer", ""),
+                bloom_level=bloom_level,
                 node_path=path_str,
             )
 
