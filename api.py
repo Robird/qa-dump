@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import json
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -47,6 +48,16 @@ class LLMClient:
             max_tokens=max_tokens,
         ).data
 
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=2, max=60),
+        retry=retry_if_exception_type((
+            httpx.HTTPStatusError,
+            httpx.TimeoutException,
+            LLMResponseError,
+        )),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+    )
     def chat_json_result(
         self,
         messages: list[dict],
@@ -70,16 +81,6 @@ class LLMClient:
             "response_format": {"type": "json_object"},
         }
 
-    @retry(
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=1, min=2, max=60),
-        retry=retry_if_exception_type((
-            httpx.HTTPStatusError,
-            httpx.TimeoutException,
-            LLMResponseError,
-        )),
-        before_sleep=before_sleep_log(logger, logging.WARNING),
-    )
     def _post(self, body: dict) -> dict:
         with httpx.Client() as client:
             resp = client.post(
@@ -101,21 +102,69 @@ class LLMClient:
     @staticmethod
     def _extract_json(raw_response: dict) -> dict:
         try:
-            content = raw_response["choices"][0]["message"]["content"]
+            message = raw_response["choices"][0]["message"]
         except (KeyError, IndexError) as e:
             raise LLMResponseError(f"Unexpected response structure: {e}")
 
-        cleaned = content.strip()
-        if cleaned.startswith("```"):
-            lines = cleaned.split("\n")
-            lines = [line for line in lines if not line.startswith("```")]
-            cleaned = "\n".join(lines).strip()
+        cleaned = LLMClient._normalize_message_content(message.get("content", ""))
+        if not cleaned:
+            finish_reason = raw_response.get("choices", [{}])[0].get("finish_reason", "unknown")
+            reasoning = LLMClient._extract_reasoning_content(raw_response).strip()
+            raise LLMResponseError(
+                "Empty content from model when JSON was expected. "
+                f"finish_reason={finish_reason!r}, reasoning_preview={reasoning[:200]!r}"
+            )
+
+        cleaned = LLMClient._strip_code_fences(cleaned)
+        candidate = LLMClient._extract_json_candidate(cleaned)
 
         try:
-            return json.loads(cleaned)
+            parsed = json.loads(candidate)
         except json.JSONDecodeError as e:
             snippet = cleaned[:500]
             raise LLMResponseError(f"Invalid JSON from model: {e}\nContent preview: {snippet}")
+        if not isinstance(parsed, dict):
+            raise LLMResponseError(f"Expected JSON object from model, got {type(parsed).__name__}")
+        return parsed
+
+    @staticmethod
+    def _normalize_message_content(content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    text = item.strip()
+                    if text:
+                        parts.append(text)
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text") or item.get("content", "")
+                if text:
+                    parts.append(str(text).strip())
+            return "\n".join(part for part in parts if part).strip()
+        return str(content).strip() if content else ""
+
+    @staticmethod
+    def _strip_code_fences(content: str) -> str:
+        cleaned = content.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+            lines = [line for line in lines if not line.startswith("```")]
+            cleaned = "\n".join(lines).strip()
+        return cleaned
+
+    @staticmethod
+    def _extract_json_candidate(content: str) -> str:
+        stripped = content.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            return stripped
+        match = re.search(r"\{.*\}", stripped, flags=re.DOTALL)
+        if match:
+            return match.group(0)
+        return stripped
 
     @staticmethod
     def _extract_reasoning_content(raw_response: dict) -> str:
