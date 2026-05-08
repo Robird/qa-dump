@@ -13,11 +13,13 @@ Resume from a checkpoint at any phase with --resume.
 """
 
 import argparse
+from dataclasses import dataclass
 import json
 import logging
 import os
 import signal
 import sys
+from pathlib import Path
 from typing import Optional
 
 from api import LLMClient
@@ -125,25 +127,29 @@ def discover_domains(client: LLMClient, prompts: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Meta-checkpoint: tracks domain-level progress across Phase-0 → all domains
+# Meta-checkpoint: persists domain ordering across Phase-0 → all domains
 # ---------------------------------------------------------------------------
 
 class MetaCheckpoint:
-    """Tracks which domains have been fully processed."""
+    """Persists discovered domain ordering for run-level resume."""
 
     def __init__(self, path: str):
         self.path = path
 
-    def load(self) -> dict:
+    def load(self) -> list[dict]:
         if os.path.exists(self.path):
             with open(self.path, encoding="utf-8") as f:
-                return json.load(f)
-        return {"domains": [], "done": []}
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                domains = raw.get("domains", [])
+                return domains if isinstance(domains, list) else []
+            return raw if isinstance(raw, list) else []
+        return []
 
-    def save(self, domains: list[dict], done_slugs: list[str]) -> None:
+    def save(self, domains: list[dict]) -> None:
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"domains": domains, "done": done_slugs}, f, indent=2, ensure_ascii=False)
+            json.dump({"domains": domains}, f, indent=2, ensure_ascii=False)
         os.replace(tmp, self.path)
 
 
@@ -175,6 +181,109 @@ def save_run_metadata(out_base: str, run_id: str, args: argparse.Namespace) -> N
             "model_answers": args.model_answers,
         },
     )
+
+
+@dataclass(frozen=True)
+class DomainScanState:
+    slug: str
+    name: str
+    checkpoint: Checkpoint
+
+    @property
+    def is_complete(self) -> bool:
+        return self.checkpoint.phase == Phase.ANSWER_GENERATION and not self.checkpoint.answer_queue
+
+    def as_domain_entry(self) -> dict:
+        return {
+            "name": self.name,
+            "slug": self.slug,
+            "description": "",
+        }
+
+
+@dataclass(frozen=True)
+class ResumePlan:
+    domains: list[dict]
+    done_slugs: set[str]
+    source: Optional[str]
+
+
+def scan_domain_checkpoints(out_base: str) -> dict[str, DomainScanState]:
+    scan: dict[str, DomainScanState] = {}
+    base = Path(out_base)
+    if not base.exists():
+        return scan
+
+    for child in sorted(base.iterdir()):
+        if not child.is_dir() or child.name == "exports" or child.name.startswith("."):
+            continue
+        checkpoint_path = child / ".checkpoint.json"
+        if not checkpoint_path.exists():
+            continue
+
+        try:
+            checkpoint = Checkpoint(**json.loads(checkpoint_path.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, OSError, ValueError) as exc:
+            logger.warning("Skipping unreadable checkpoint at %s: %s", checkpoint_path, exc)
+            continue
+
+        domain_name = child.name
+        if checkpoint.knowledge_tree is not None:
+            domain_name = checkpoint.knowledge_tree.domain or domain_name
+
+        scan[child.name] = DomainScanState(
+            slug=child.name,
+            name=domain_name,
+            checkpoint=checkpoint,
+        )
+    return scan
+
+
+def build_resume_plan(meta_domains: list[dict], scan: dict[str, DomainScanState]) -> ResumePlan:
+    done_slugs = {slug for slug, state in scan.items() if state.is_complete}
+    scan_domains = [scan[slug].as_domain_entry() for slug in sorted(scan)]
+
+    if meta_domains:
+        if not scan:
+            return ResumePlan(meta_domains, done_slugs, "saved meta checkpoint")
+
+        meta_slugs = {domain.get("slug", "") for domain in meta_domains}
+        scan_slugs = set(scan)
+        if scan_slugs.issubset(meta_slugs):
+            return ResumePlan(meta_domains, done_slugs, "saved meta checkpoint")
+
+        logger.warning(
+            "Meta checkpoint domains do not match checkpoint directories; "
+            "resuming from checkpoint directories instead."
+        )
+        return ResumePlan(scan_domains, done_slugs, "checkpoint directories")
+
+    if scan_domains:
+        return ResumePlan(scan_domains, done_slugs, "checkpoint directories")
+
+    return ResumePlan([], done_slugs, None)
+
+
+def resolve_seed_domain_entry(seed_domain: str, scan: dict[str, DomainScanState], resume: bool) -> dict:
+    default = {"name": seed_domain, "slug": to_slug(seed_domain), "description": ""}
+    if not resume:
+        return default
+
+    for state in scan.values():
+        if state.name == seed_domain or state.slug == seed_domain or state.slug == default["slug"]:
+            return state.as_domain_entry()
+
+    return default
+
+
+def discover_and_print_domains(base_url: str, api_key: str, model: str, prompts: dict) -> list[dict]:
+    print("Phase 0 — discovering top-level knowledge domains ...")
+    client = make_client(base_url, api_key, model)
+    domains = discover_domains(client, prompts)
+    print(f"Found {len(domains)} domains:")
+    for domain in domains:
+        print(f"  - {domain['name']} ({domain['slug']})")
+    return domains
 
 
 # ---------------------------------------------------------------------------
@@ -273,26 +382,32 @@ def run(args: argparse.Namespace, base_url: str, api_key: str) -> None:
     os.makedirs(out_base, exist_ok=True)
     save_run_metadata(out_base, run_id, args)
     exporter = DatasetExporter(os.path.join(out_base, "exports"), run_id)
+    meta_cp = MetaCheckpoint(os.path.join(out_base, ".meta_checkpoint.json"))
+    meta_domains = meta_cp.load() if args.resume else []
+    checkpoint_scan = scan_domain_checkpoints(out_base) if args.resume else {}
+    done_slugs: set[str] = {slug for slug, state in checkpoint_scan.items() if state.is_complete}
 
     # ---- Determine domains to process ----
     if args.seed_domain:
-        domains = [{"name": args.seed_domain, "slug": to_slug(args.seed_domain), "description": ""}]
+        domains = [resolve_seed_domain_entry(args.seed_domain, checkpoint_scan, args.resume)]
+    elif args.resume:
+        resume_plan = build_resume_plan(meta_domains, checkpoint_scan)
+        domains = resume_plan.domains
+        done_slugs = resume_plan.done_slugs
+        if domains:
+            source = resume_plan.source or "checkpoint directories"
+            print(f"Resume mode — loaded {len(domains)} domains from {source}")
+        else:
+            print("Resume mode — no saved domains found, falling back to fresh discovery")
     else:
-        print("Phase 0 — discovering top-level knowledge domains ...")
-        client = make_client(base_url, api_key, args.model_catalog)
-        domains = discover_domains(client, prompts)
-        print(f"Found {len(domains)} domains:")
-        for d in domains:
-            print(f"  - {d['name']} ({d['slug']})")
+        domains = discover_and_print_domains(base_url, api_key, args.model_catalog, prompts)
 
-    # Meta-checkpoint for domain-level progress
-    meta_cp = MetaCheckpoint(os.path.join(out_base, ".meta_checkpoint.json"))
-    meta_state = meta_cp.load() if args.resume else {"domains": [], "done": []}
-    done_slugs: set[str] = set(meta_state.get("done", []))
+    if not args.seed_domain and not domains:
+        domains = discover_and_print_domains(base_url, api_key, args.model_catalog, prompts)
 
     # Persist discovered domains so resume doesn't need to re-discover
     if not args.seed_domain:
-        meta_cp.save(domains, list(done_slugs))
+        meta_cp.save(domains)
 
     domain_summaries: list[dict] = []
 
@@ -320,7 +435,6 @@ def run(args: argparse.Namespace, base_url: str, api_key: str) -> None:
             domain_summaries.append(summary)
 
         done_slugs.add(slug)
-        meta_cp.save(domains, list(done_slugs))
 
     exporter.export_run(domain_summaries, lang)
     print(f"\nAll done. Output: {os.path.abspath(out_base)}")

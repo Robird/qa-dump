@@ -45,6 +45,7 @@ class AnswerItem(BaseModel):
     question_id: str
     question: str = ""
     answer: str
+    reasoning_content: str = ""
     bloom_level: str = ""
     node_path: str = ""
 

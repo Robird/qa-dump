@@ -1,5 +1,7 @@
+from dataclasses import dataclass
 import json
 import logging
+from typing import Any
 
 import httpx
 from tenacity import (
@@ -17,6 +19,12 @@ class LLMResponseError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class ChatJSONResult:
+    data: dict[str, Any]
+    reasoning_content: str = ""
+
+
 class LLMClient:
     def __init__(self, base_url: str, api_key: str, model: str, timeout: int = 120):
         self.base_url = base_url.rstrip("/")
@@ -32,19 +40,35 @@ class LLMClient:
         messages: list[dict],
         temperature: float = 0.3,
         max_tokens: int = 2048,
-        json_mode: bool = True,
     ) -> dict:
-        body: dict = {
+        return self.chat_json_result(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        ).data
+
+    def chat_json_result(
+        self,
+        messages: list[dict],
+        temperature: float = 0.3,
+        max_tokens: int = 2048,
+    ) -> ChatJSONResult:
+        raw = self._post(self._build_chat_body(messages, temperature, max_tokens))
+        return self._parse_chat_json_result(raw)
+
+    def _build_chat_body(
+        self,
+        messages: list[dict],
+        temperature: float,
+        max_tokens: int,
+    ) -> dict[str, Any]:
+        return {
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
         }
-        if json_mode:
-            body["response_format"] = {"type": "json_object"}
-
-        raw = self._post(body)
-        return self._extract_json(raw)
 
     @retry(
         stop=stop_after_attempt(5),
@@ -67,6 +91,13 @@ class LLMClient:
             resp.raise_for_status()
             return resp.json()
 
+    @classmethod
+    def _parse_chat_json_result(cls, raw_response: dict) -> ChatJSONResult:
+        return ChatJSONResult(
+            data=cls._extract_json(raw_response),
+            reasoning_content=cls._extract_reasoning_content(raw_response),
+        )
+
     @staticmethod
     def _extract_json(raw_response: dict) -> dict:
         try:
@@ -85,3 +116,23 @@ class LLMClient:
         except json.JSONDecodeError as e:
             snippet = cleaned[:500]
             raise LLMResponseError(f"Invalid JSON from model: {e}\nContent preview: {snippet}")
+
+    @staticmethod
+    def _extract_reasoning_content(raw_response: dict) -> str:
+        try:
+            message = raw_response["choices"][0]["message"]
+        except (KeyError, IndexError):
+            return ""
+
+        reasoning = message.get("reasoning_content", "")
+        if isinstance(reasoning, list):
+            parts: list[str] = []
+            for item in reasoning:
+                if isinstance(item, dict):
+                    text = item.get("text", "")
+                    if text:
+                        parts.append(str(text))
+                elif item:
+                    parts.append(str(item))
+            return "\n".join(parts)
+        return str(reasoning) if reasoning else ""
