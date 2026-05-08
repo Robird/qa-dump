@@ -17,8 +17,10 @@ from dataclasses import dataclass
 import json
 import logging
 import os
-import signal
+import shlex
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -86,6 +88,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="Verbose logging",
+    )
+    parser.add_argument(
+        "--max-workers", type=int, default=1,
+        help="Maximum concurrent top-level domain workers",
+    )
+    parser.add_argument(
+        "--worker", action="store_true", help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--worker-domain-name", default="", help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--worker-domain-slug", default="", help=argparse.SUPPRESS
     )
     return parser.parse_args()
 
@@ -179,6 +194,7 @@ def save_run_metadata(out_base: str, run_id: str, args: argparse.Namespace) -> N
             "model_catalog": args.model_catalog,
             "model_questions": args.model_questions,
             "model_answers": args.model_answers,
+            "max_workers": args.max_workers,
         },
     )
 
@@ -286,6 +302,145 @@ def discover_and_print_domains(base_url: str, api_key: str, model: str, prompts:
     return domains
 
 
+def resolve_domains_to_process(
+    args: argparse.Namespace,
+    out_base: str,
+    prompts: dict,
+    base_url: str,
+    api_key: str,
+) -> tuple[list[dict], set[str]]:
+    meta_cp = MetaCheckpoint(os.path.join(out_base, ".meta_checkpoint.json"))
+    meta_domains = meta_cp.load() if args.resume else []
+    checkpoint_scan = scan_domain_checkpoints(out_base) if args.resume else {}
+    done_slugs: set[str] = {slug for slug, state in checkpoint_scan.items() if state.is_complete}
+
+    if args.seed_domain:
+        domains = [resolve_seed_domain_entry(args.seed_domain, checkpoint_scan, args.resume)]
+    elif args.resume:
+        resume_plan = build_resume_plan(meta_domains, checkpoint_scan)
+        domains = resume_plan.domains
+        done_slugs = resume_plan.done_slugs
+        if domains:
+            source = resume_plan.source or "checkpoint directories"
+            print(f"Resume mode — loaded {len(domains)} domains from {source}")
+        else:
+            print("Resume mode — no saved domains found, falling back to fresh discovery")
+    else:
+        domains = discover_and_print_domains(base_url, api_key, args.model_catalog, prompts)
+
+    if not args.seed_domain and not domains:
+        domains = discover_and_print_domains(base_url, api_key, args.model_catalog, prompts)
+
+    if not args.seed_domain:
+        meta_cp.save(domains)
+
+    return domains, done_slugs
+
+
+def build_worker_command(
+    args: argparse.Namespace,
+    out_base: str,
+    domain: dict,
+    resume: bool,
+) -> list[str]:
+    cmd = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--worker",
+        "--worker-domain-name",
+        domain["name"],
+        "--worker-domain-slug",
+        domain["slug"],
+        "--output-dir",
+        out_base,
+        "--language",
+        args.language,
+        "--max-depth",
+        str(args.max_depth),
+        "--questions-per-node",
+        str(args.questions_per_node),
+        "--model-catalog",
+        args.model_catalog,
+        "--model-questions",
+        args.model_questions,
+        "--model-answers",
+        args.model_answers,
+        "--temperature",
+        str(args.temperature),
+        "--max-workers",
+        "1",
+    ]
+    if args.run_id:
+        cmd.extend(["--run-id", args.run_id])
+    if args.verbose:
+        cmd.append("--verbose")
+    if resume:
+        cmd.append("--resume")
+    return cmd
+
+
+def export_completed_domains(out_base: str, run_id: str, language: str) -> dict:
+    exporter = DatasetExporter(os.path.join(out_base, "exports"), run_id)
+    domain_summaries: list[dict] = []
+    for slug, state in sorted(scan_domain_checkpoints(out_base).items()):
+        if not state.is_complete:
+            continue
+        storage = StorageManager(os.path.join(out_base, slug))
+        summary = export_domain_if_complete(storage, exporter, language)
+        if summary is not None:
+            domain_summaries.append(summary)
+    return exporter.export_run(domain_summaries, language)
+
+
+def terminate_processes(processes: list[subprocess.Popen]) -> None:
+    for proc in processes:
+        if proc.poll() is None:
+            proc.terminate()
+
+    deadline = time.time() + 5
+    for proc in processes:
+        if proc.poll() is not None:
+            continue
+        timeout = max(0.0, deadline - time.time())
+        if timeout == 0:
+            break
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            pass
+
+    for proc in processes:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def print_resume_hint(args: argparse.Namespace) -> None:
+    out = args.output_dir or f"./output/{args.language}"
+    cmd = ["python", "main.py", "--resume", "--output-dir", out, "--language", args.language]
+    if args.seed_domain:
+        cmd.extend(["--seed-domain", args.seed_domain])
+    if args.max_depth != 3:
+        cmd.extend(["--max-depth", str(args.max_depth)])
+    if args.questions_per_node != 5:
+        cmd.extend(["--questions-per-node", str(args.questions_per_node)])
+    if args.model_catalog != "deepseek-v4-flash":
+        cmd.extend(["--model-catalog", args.model_catalog])
+    if args.model_questions != "deepseek-v4-flash":
+        cmd.extend(["--model-questions", args.model_questions])
+    if args.model_answers != "deepseek-v4-pro":
+        cmd.extend(["--model-answers", args.model_answers])
+    if args.temperature != 0.3:
+        cmd.extend(["--temperature", str(args.temperature)])
+    if args.run_id:
+        cmd.extend(["--run-id", args.run_id])
+    if args.max_workers != 1:
+        cmd.extend(["--max-workers", str(args.max_workers)])
+    if args.verbose:
+        cmd.append("--verbose")
+    print("\nInterrupted. Resume with:", file=sys.stderr)
+    print(f"  {shlex.join(cmd)}", file=sys.stderr)
+
+
 # ---------------------------------------------------------------------------
 # Per-domain pipeline (Phases 1–3)
 # ---------------------------------------------------------------------------
@@ -374,69 +529,83 @@ def export_domain_if_complete(
 # Main orchestration
 # ---------------------------------------------------------------------------
 
-def run(args: argparse.Namespace, base_url: str, api_key: str) -> None:
+def run_worker(args: argparse.Namespace, base_url: str, api_key: str) -> None:
+    if not args.worker_domain_name or not args.worker_domain_slug:
+        raise ValueError("Worker mode requires both worker domain name and slug")
+
+    out_base = args.output_dir or f"./output/{args.language}"
+    prompts = get_prompts(args.language)
+    domain_output = os.path.join(out_base, args.worker_domain_slug)
+    storage = StorageManager(domain_output)
+
+    print(f"\n{'=' * 60}")
+    print(f"[worker] {args.worker_domain_name} ({args.worker_domain_slug})")
+    print(f"{'=' * 60}")
+    run_domain(args.worker_domain_name, storage, prompts, args, base_url, api_key)
+
+
+def run_controller(args: argparse.Namespace, base_url: str, api_key: str) -> None:
     lang = args.language
     out_base = args.output_dir or f"./output/{lang}"
     prompts = get_prompts(lang)
     run_id = resolve_run_id(args, out_base)
     os.makedirs(out_base, exist_ok=True)
     save_run_metadata(out_base, run_id, args)
-    exporter = DatasetExporter(os.path.join(out_base, "exports"), run_id)
-    meta_cp = MetaCheckpoint(os.path.join(out_base, ".meta_checkpoint.json"))
-    meta_domains = meta_cp.load() if args.resume else []
-    checkpoint_scan = scan_domain_checkpoints(out_base) if args.resume else {}
-    done_slugs: set[str] = {slug for slug, state in checkpoint_scan.items() if state.is_complete}
+    domains, done_slugs = resolve_domains_to_process(args, out_base, prompts, base_url, api_key)
 
-    # ---- Determine domains to process ----
-    if args.seed_domain:
-        domains = [resolve_seed_domain_entry(args.seed_domain, checkpoint_scan, args.resume)]
-    elif args.resume:
-        resume_plan = build_resume_plan(meta_domains, checkpoint_scan)
-        domains = resume_plan.domains
-        done_slugs = resume_plan.done_slugs
-        if domains:
-            source = resume_plan.source or "checkpoint directories"
-            print(f"Resume mode — loaded {len(domains)} domains from {source}")
-        else:
-            print("Resume mode — no saved domains found, falling back to fresh discovery")
-    else:
-        domains = discover_and_print_domains(base_url, api_key, args.model_catalog, prompts)
-
-    if not args.seed_domain and not domains:
-        domains = discover_and_print_domains(base_url, api_key, args.model_catalog, prompts)
-
-    # Persist discovered domains so resume doesn't need to re-discover
-    if not args.seed_domain:
-        meta_cp.save(domains)
-
-    domain_summaries: list[dict] = []
-
-    # Process each domain
+    pending_domains = [dom for dom in domains if dom["slug"] not in done_slugs]
     for i, dom in enumerate(domains):
-        slug = dom["slug"]
-        domain_output = os.path.join(out_base, slug)
-        storage = StorageManager(domain_output)
-        storage.setup()
-
-        if slug in done_slugs:
+        if dom["slug"] in done_slugs:
             print(f"\n[{i + 1}/{len(domains)}] {dom['name']} — already done, skipping")
-            summary = export_domain_if_complete(storage, exporter, lang)
-            if summary is not None:
-                domain_summaries.append(summary)
-            continue
+    if done_slugs:
+        export_completed_domains(out_base, run_id, lang)
 
-        print(f"\n{'=' * 60}")
-        print(f"[{i + 1}/{len(domains)}] {dom['name']}")
-        print(f"{'=' * 60}")
+    max_workers = max(1, args.max_workers)
+    active: list[tuple[subprocess.Popen, dict]] = []
+    pending_index = 0
 
-        run_domain(dom["name"], storage, prompts, args, base_url, api_key)
-        summary = export_domain_if_complete(storage, exporter, lang)
-        if summary is not None:
-            domain_summaries.append(summary)
+    try:
+        while pending_index < len(pending_domains) or active:
+            while pending_index < len(pending_domains) and len(active) < max_workers:
+                domain = pending_domains[pending_index]
+                pending_index += 1
+                cmd = build_worker_command(args, out_base, domain, args.resume)
+                print(
+                    f"\nLaunching worker {pending_index}/{len(pending_domains)} "
+                    f"for {domain['name']} ({domain['slug']})"
+                )
+                proc = subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parent), start_new_session=True)
+                active.append((proc, domain))
 
-        done_slugs.add(slug)
+            if not active:
+                continue
 
-    exporter.export_run(domain_summaries, lang)
+            time.sleep(0.2)
+            still_active: list[tuple[subprocess.Popen, dict]] = []
+            for proc, domain in active:
+                code = proc.poll()
+                if code is None:
+                    still_active.append((proc, domain))
+                    continue
+                if code != 0:
+                    remaining = [p for p, _ in still_active]
+                    remaining.extend(p for p, _ in active if p is not proc and p not in remaining)
+                    terminate_processes(remaining)
+                    print(
+                        f"Worker failed: {domain['name']} ({domain['slug']})",
+                        file=sys.stderr,
+                    )
+                    print_resume_hint(args)
+                    raise SystemExit(code)
+                print(f"Worker finished: {domain['name']} ({domain['slug']})")
+                export_completed_domains(out_base, run_id, lang)
+            active = still_active
+    except KeyboardInterrupt:
+        terminate_processes([proc for proc, _ in active])
+        print_resume_hint(args)
+        raise SystemExit(1)
+
+    export_completed_domains(out_base, run_id, lang)
     print(f"\nAll done. Output: {os.path.abspath(out_base)}")
     print(f"Run ID: {run_id}")
     print(f"Dataset export: {os.path.abspath(os.path.join(out_base, 'exports', 'dataset.jsonl'))}")
@@ -455,18 +624,10 @@ def main() -> None:
 
     base_url, api_key = get_env()
 
-    def _on_sigint(signum, frame):
-        print("\nInterrupted. Checkpoint saved. Resume with:", file=sys.stderr)
-        out = args.output_dir or f"./output/{args.language}"
-        cmd = f"python main.py --resume --output-dir {out} --language {args.language}"
-        if args.run_id:
-            cmd += f" --run-id {args.run_id}"
-        print(f"  {cmd}", file=sys.stderr)
-        sys.exit(1)
-
-    signal.signal(signal.SIGINT, _on_sigint)
-
-    run(args, base_url, api_key)
+    if args.worker:
+        run_worker(args, base_url, api_key)
+    else:
+        run_controller(args, base_url, api_key)
 
 
 if __name__ == "__main__":
