@@ -1,0 +1,5 @@
+output/
+test_output/
+__pycache__/
+*.pyc
+*.tmp
