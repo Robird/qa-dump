@@ -59,7 +59,7 @@ class QuestionGenerator:
                     name=leaf.name, description=leaf.description, count=self.count
                 )},
             ]
-            result = self.llm.chat_json(messages, max_tokens=4096)
+            result = self.llm.chat_json(messages)
 
             questions = self._parse_questions(result, path_str)
             qset = QuestionSet(node_path=path_str, questions=questions)

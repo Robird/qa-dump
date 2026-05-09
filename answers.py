@@ -44,7 +44,7 @@ class AnswerGenerator:
                 {"role": "system", "content": self.p["answer_system"]},
                 {"role": "user", "content": self.p["answer_user"].format(question=text)},
             ]
-            response = self.llm.chat_json_result(messages, max_tokens=8192)
+            response = self.llm.chat_json_result(messages)
             result = response.data
 
             answer = AnswerItem(

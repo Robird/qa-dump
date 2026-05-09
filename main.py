@@ -128,7 +128,7 @@ def discover_domains(client: LLMClient, prompts: dict) -> list[dict]:
         {"role": "system", "content": prompts["domain_system"]},
         {"role": "user", "content": prompts["domain_user"]},
     ]
-    result = client.chat_json(messages, max_tokens=4096)
+    result = client.chat_json(messages)
     domains = []
     for item in result.get("categories", []):
         slug = item.get("slug", "") or to_slug(item.get("name", ""))

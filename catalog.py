@@ -86,7 +86,7 @@ class CatalogBuilder:
             {"role": "system", "content": self.p["root_system"]},
             {"role": "user", "content": self.p["root_user"].format(domain=domain)},
         ]
-        result = self.llm.chat_json(messages, max_tokens=4096)
+        result = self.llm.chat_json(messages)
         children = self._parse_categories(result)
         for child in children:
             child.depth = 1
@@ -105,7 +105,7 @@ class CatalogBuilder:
                 name=node.name, description=node.description
             )},
         ]
-        result = self.llm.chat_json(messages, max_tokens=4096)
+        result = self.llm.chat_json(messages)
         return self._parse_categories(result)
 
     @staticmethod

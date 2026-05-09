@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import json
 import logging
 import re
+from typing import Optional
 from typing import Any
 
 import httpx
@@ -40,7 +41,7 @@ class LLMClient:
         self,
         messages: list[dict],
         temperature: float = 0.3,
-        max_tokens: int = 2048,
+        max_tokens: Optional[int] = None,
     ) -> dict:
         return self.chat_json_result(
             messages,
@@ -62,7 +63,7 @@ class LLMClient:
         self,
         messages: list[dict],
         temperature: float = 0.3,
-        max_tokens: int = 2048,
+        max_tokens: Optional[int] = None,
     ) -> ChatJSONResult:
         raw = self._post(self._build_chat_body(messages, temperature, max_tokens))
         return self._parse_chat_json_result(raw)
@@ -71,15 +72,17 @@ class LLMClient:
         self,
         messages: list[dict],
         temperature: float,
-        max_tokens: int,
+        max_tokens: Optional[int],
     ) -> dict[str, Any]:
-        return {
+        body = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": max_tokens,
             "response_format": {"type": "json_object"},
         }
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
+        return body
 
     def _post(self, body: dict) -> dict:
         with httpx.Client() as client:
