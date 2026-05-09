@@ -13,6 +13,7 @@ Resume from a checkpoint at any phase with --resume.
 """
 
 import argparse
+from contextlib import closing
 from dataclasses import dataclass
 import json
 import logging
@@ -92,6 +93,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-workers", type=int, default=1,
         help="Maximum concurrent top-level domain workers",
+    )
+    parser.add_argument(
+        "--fail-fast", action="store_true",
+        help="Stop all workers as soon as any worker exits with an error",
     )
     parser.add_argument(
         "--worker", action="store_true", help=argparse.SUPPRESS
@@ -294,8 +299,8 @@ def resolve_seed_domain_entry(seed_domain: str, scan: dict[str, DomainScanState]
 
 def discover_and_print_domains(base_url: str, api_key: str, model: str, prompts: dict) -> list[dict]:
     print("Phase 0 — discovering top-level knowledge domains ...")
-    client = make_client(base_url, api_key, model)
-    domains = discover_domains(client, prompts)
+    with closing(make_client(base_url, api_key, model)) as client:
+        domains = discover_domains(client, prompts)
     print(f"Found {len(domains)} domains:")
     for domain in domains:
         print(f"  - {domain['name']} ({domain['slug']})")
@@ -414,7 +419,7 @@ def terminate_processes(processes: list[subprocess.Popen]) -> None:
             proc.kill()
 
 
-def print_resume_hint(args: argparse.Namespace) -> None:
+def print_resume_hint(args: argparse.Namespace, heading: str = "Interrupted") -> None:
     out = args.output_dir or f"./output/{args.language}"
     cmd = ["python", "main.py", "--resume", "--output-dir", out, "--language", args.language]
     if args.seed_domain:
@@ -435,9 +440,11 @@ def print_resume_hint(args: argparse.Namespace) -> None:
         cmd.extend(["--run-id", args.run_id])
     if args.max_workers != 1:
         cmd.extend(["--max-workers", str(args.max_workers)])
+    if args.fail_fast:
+        cmd.append("--fail-fast")
     if args.verbose:
         cmd.append("--verbose")
-    print("\nInterrupted. Resume with:", file=sys.stderr)
+    print(f"\n{heading}. Resume with:", file=sys.stderr)
     print(f"  {shlex.join(cmd)}", file=sys.stderr)
 
 
@@ -470,44 +477,44 @@ def run_domain(
     # Phase 1: Catalog Discovery
     if checkpoint is None or checkpoint.phase == Phase.CATALOG_DISCOVERY:
         print("  Phase 1 — catalog discovery (BFS)")
-        client = make_client(base_url, api_key, args.model_catalog)
-        builder = CatalogBuilder(
-            llm=client,
-            max_depth=args.max_depth,
-            storage=storage,
-            prompts=prompts,
-            checkpoint=checkpoint,
-        )
-        tree = builder.run(seed_domain)
+        with closing(make_client(base_url, api_key, args.model_catalog)) as client:
+            builder = CatalogBuilder(
+                llm=client,
+                max_depth=args.max_depth,
+                storage=storage,
+                prompts=prompts,
+                checkpoint=checkpoint,
+            )
+            tree = builder.run(seed_domain)
         checkpoint = Checkpoint(phase=Phase.QUESTION_GENERATION, knowledge_tree=tree)
         storage.save_checkpoint(checkpoint)
 
     # Phase 2: Question Generation
     if checkpoint and checkpoint.phase == Phase.QUESTION_GENERATION:
         print("  Phase 2 — question generation")
-        client = make_client(base_url, api_key, args.model_questions)
-        qgen = QuestionGenerator(
-            llm=client,
-            count=args.questions_per_node,
-            storage=storage,
-            prompts=prompts,
-            checkpoint=checkpoint,
-        )
-        qgen.run()
+        with closing(make_client(base_url, api_key, args.model_questions)) as client:
+            qgen = QuestionGenerator(
+                llm=client,
+                count=args.questions_per_node,
+                storage=storage,
+                prompts=prompts,
+                checkpoint=checkpoint,
+            )
+            qgen.run()
 
     checkpoint = storage.load_checkpoint()
 
     # Phase 3: Answer Generation
     if checkpoint and checkpoint.phase == Phase.ANSWER_GENERATION:
         print("  Phase 3 — answer generation")
-        client = make_client(base_url, api_key, args.model_answers)
-        agen = AnswerGenerator(
-            llm=client,
-            storage=storage,
-            prompts=prompts,
-            checkpoint=checkpoint,
-        )
-        agen.run()
+        with closing(make_client(base_url, api_key, args.model_answers)) as client:
+            agen = AnswerGenerator(
+                llm=client,
+                storage=storage,
+                prompts=prompts,
+                checkpoint=checkpoint,
+            )
+            agen.run()
 
     print(f"  Done — {seed_domain}")
 
@@ -563,6 +570,7 @@ def run_controller(args: argparse.Namespace, base_url: str, api_key: str) -> Non
     max_workers = max(1, args.max_workers)
     active: list[tuple[subprocess.Popen, dict]] = []
     pending_index = 0
+    worker_failures: list[tuple[dict, int]] = []
 
     try:
         while pending_index < len(pending_domains) or active:
@@ -588,15 +596,23 @@ def run_controller(args: argparse.Namespace, base_url: str, api_key: str) -> Non
                     still_active.append((proc, domain))
                     continue
                 if code != 0:
-                    remaining = [p for p, _ in still_active]
-                    remaining.extend(p for p, _ in active if p is not proc and p not in remaining)
-                    terminate_processes(remaining)
+                    if args.fail_fast:
+                        remaining = [p for p, _ in still_active]
+                        remaining.extend(p for p, _ in active if p is not proc and p not in remaining)
+                        terminate_processes(remaining)
+                        print(
+                            f"Worker failed: {domain['name']} ({domain['slug']})",
+                            file=sys.stderr,
+                        )
+                        print_resume_hint(args)
+                        raise SystemExit(code)
+
+                    worker_failures.append((domain, code))
                     print(
-                        f"Worker failed: {domain['name']} ({domain['slug']})",
+                        f"Worker failed, continuing: {domain['name']} ({domain['slug']}), exit code {code}",
                         file=sys.stderr,
                     )
-                    print_resume_hint(args)
-                    raise SystemExit(code)
+                    continue
                 print(f"Worker finished: {domain['name']} ({domain['slug']})")
                 export_completed_domains(out_base, run_id, lang)
             active = still_active
@@ -606,6 +622,16 @@ def run_controller(args: argparse.Namespace, base_url: str, api_key: str) -> Non
         raise SystemExit(1)
 
     export_completed_domains(out_base, run_id, lang)
+    if worker_failures:
+        print("\nRun finished with worker failures:", file=sys.stderr)
+        for domain, code in worker_failures:
+            print(
+                f"  - {domain['name']} ({domain['slug']}), exit code {code}",
+                file=sys.stderr,
+            )
+        print_resume_hint(args, heading="Run finished with worker failures")
+        raise SystemExit(1)
+
     print(f"\nAll done. Output: {os.path.abspath(out_base)}")
     print(f"Run ID: {run_id}")
     print(f"Dataset export: {os.path.abspath(os.path.join(out_base, 'exports', 'dataset.jsonl'))}")

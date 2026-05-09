@@ -9,7 +9,7 @@ import httpx
 from tenacity import (
     before_sleep_log,
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -19,6 +19,17 @@ logger = logging.getLogger(__name__)
 
 class LLMResponseError(Exception):
     pass
+
+
+RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+
+
+def _is_retryable_exception(exc: BaseException) -> bool:
+    if isinstance(exc, LLMResponseError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in RETRYABLE_STATUS_CODES
+    return isinstance(exc, httpx.RequestError)
 
 
 @dataclass(frozen=True)
@@ -36,6 +47,16 @@ class LLMClient:
             "Content-Type": "application/json",
         }
         self.timeout = timeout
+        self._client = httpx.Client(headers=self.headers, timeout=self.timeout)
+
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> "LLMClient":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.close()
 
     def chat_json(
         self,
@@ -52,11 +73,7 @@ class LLMClient:
     @retry(
         stop=stop_after_attempt(5),
         wait=wait_exponential(multiplier=1, min=2, max=60),
-        retry=retry_if_exception_type((
-            httpx.HTTPStatusError,
-            httpx.TimeoutException,
-            LLMResponseError,
-        )),
+        retry=retry_if_exception(_is_retryable_exception),
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )
     def chat_json_result(
@@ -85,15 +102,12 @@ class LLMClient:
         return body
 
     def _post(self, body: dict) -> dict:
-        with httpx.Client() as client:
-            resp = client.post(
-                f"{self.base_url}/chat/completions",
-                headers=self.headers,
-                json=body,
-                timeout=self.timeout,
-            )
-            resp.raise_for_status()
-            return resp.json()
+        resp = self._client.post(
+            f"{self.base_url}/chat/completions",
+            json=body,
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     @classmethod
     def _parse_chat_json_result(cls, raw_response: dict) -> ChatJSONResult:
