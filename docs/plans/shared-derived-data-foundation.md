@@ -37,6 +37,7 @@ This foundation should provide:
 - standardized output layout
 - summary manifests
 - validation hooks
+- semantic export and protocol projection hooks
 
 This foundation should not contain task-specific prompting or task-specific output schemas beyond shared wrappers.
 
@@ -196,6 +197,14 @@ Each task should produce:
 - aggregate JSONL export
 - manifest with counts and configuration
 - failure summary
+
+Where practical, exports should distinguish:
+
+- semantic truth records
+- protocol-ready projections
+- human-readable text projections
+
+The prompt string should not be treated as the only source of truth if the task naturally produces richer structure.
 
 Useful manifest fields:
 

@@ -25,6 +25,8 @@ Recall targets can help:
 - separate knowledge access from reasoning style
 - support staged curriculum learning
 
+They also make good early `me` targets in an agentic training protocol, because `question -> recall -> answer` is a natural bridge between plain QA SFT and richer structured agent behavior.
+
 
 ## 3. Inputs
 
