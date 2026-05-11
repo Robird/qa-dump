@@ -2,36 +2,38 @@ import json
 from pathlib import Path
 from typing import Optional
 
+from fs_utils import atomic_write_json, atomic_write_text, write_jsonl
 from models import Checkpoint, KnowledgeTree, collect_leaves
+from qa_view import QAViewLayout
 from storage import StorageManager
-
-
-def _atomic_write(path: Path, content: str) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.rename(path)
-
-
-def _to_jsonl(records: list[dict]) -> str:
-    if not records:
-        return ""
-    return "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
+from task_contracts import (
+    QA_EXPORT_SCHEMA_VERSION,
+    QA_TASK_FAMILY,
+    QA_VIEW_ID,
+    build_qa_view_manifest,
+    make_qa_sample_id,
+)
 
 
 class DatasetExporter:
     def __init__(self, output_dir: str, run_id: str):
-        self.base = Path(output_dir)
+        self.layout = QAViewLayout.from_view_dir(output_dir)
+        self.base = self.layout.view_dir
         self.run_id = run_id
         self.base.mkdir(parents=True, exist_ok=True)
+        self.layout.domains_dir.mkdir(parents=True, exist_ok=True)
 
     def _meta_path(self, domain_slug: str) -> Path:
-        return self.base / f"{domain_slug}.meta.json"
+        return self.layout.meta_path(domain_slug)
 
     def _load_cached_summary(self, domain_slug: str) -> Optional[dict]:
         meta_path = self._meta_path(domain_slug)
         if not meta_path.exists():
             return None
-        return json.loads(meta_path.read_text(encoding="utf-8"))
+        summary = json.loads(meta_path.read_text(encoding="utf-8"))
+        if summary.get("export_schema_version") != QA_EXPORT_SCHEMA_VERSION:
+            return None
+        return summary
 
     def export_domain(
         self,
@@ -42,7 +44,7 @@ class DatasetExporter:
     ) -> dict:
         domain = tree.domain
         domain_slug = tree.root.slug
-        export_path = self.base / f"{domain_slug}.jsonl"
+        export_path = self.layout.domain_path(domain_slug)
         cached = self._load_cached_summary(domain_slug)
         if cached is not None and export_path.exists():
             return cached
@@ -76,8 +78,10 @@ class DatasetExporter:
 
                 answer = storage.read_answer(path_segments, question.id)
                 records.append({
-                    "id": f"{self.run_id}:{domain_slug}:{question.id}",
+                    "id": make_qa_sample_id(self.run_id, domain_slug, question.id),
                     "run_id": self.run_id,
+                    "task_family": QA_TASK_FAMILY,
+                    "view_id": QA_VIEW_ID,
                     "question_id": question.id,
                     "messages": [
                         {"role": "user", "content": question.text},
@@ -92,57 +96,30 @@ class DatasetExporter:
                     "bloom_level": question.bloom_level,
                 })
 
-        _atomic_write(export_path, _to_jsonl(records))
+        write_jsonl(export_path, records)
         summary = {
+            "export_schema_version": QA_EXPORT_SCHEMA_VERSION,
             "domain": domain,
             "slug": domain_slug,
             "records": len(records),
-            "file": export_path.name,
+            "file": str(export_path.relative_to(self.base)),
             "question_dead_letters": len(question_dead_letters),
             "answer_dead_letters": len(answer_dead_letters),
         }
-        _atomic_write(
-            self._meta_path(domain_slug),
-            json.dumps(summary, indent=2, ensure_ascii=False),
-        )
+        atomic_write_json(self._meta_path(domain_slug), summary)
         return summary
 
     def export_run(self, domain_summaries: list[dict], language: str) -> dict:
         ordered = sorted(domain_summaries, key=lambda item: item["slug"])
         combined = []
-        total_records = 0
 
         for summary in ordered:
             content = (self.base / summary["file"]).read_text(encoding="utf-8")
             if content:
                 combined.append(content if content.endswith("\n") else content + "\n")
-            total_records += summary["records"]
 
-        _atomic_write(self.base / "dataset.jsonl", "".join(combined))
+        atomic_write_text(self.layout.dataset_path, "".join(combined))
 
-        manifest = {
-            "format": "qa-dump.sft.jsonl",
-            "format_version": 1,
-            "run_id": self.run_id,
-            "language": language,
-            "total_records": total_records,
-            "domains": ordered,
-            "fields": [
-                "id",
-                "run_id",
-                "question_id",
-                "messages",
-                "question",
-                "answer",
-                "language",
-                "domain",
-                "domain_slug",
-                "node_path",
-                "bloom_level",
-            ],
-        }
-        _atomic_write(
-            self.base / "manifest.json",
-            json.dumps(manifest, indent=2, ensure_ascii=False),
-        )
+        manifest = build_qa_view_manifest(self.run_id, language, ordered)
+        atomic_write_json(self.layout.manifest_path, manifest)
         return manifest

@@ -2,13 +2,8 @@ import json
 from pathlib import Path
 from typing import Optional
 
+from fs_utils import append_jsonl, atomic_write_json, atomic_write_text
 from models import AnswerItem, Checkpoint, KnowledgeNode, KnowledgeTree, QuestionSet
-
-
-def _atomic_write(path: Path, content: str) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.rename(path)
 
 
 class StorageManager:
@@ -21,7 +16,7 @@ class StorageManager:
     # --- Config ---
 
     def save_config(self, config: dict) -> None:
-        _atomic_write(self.base / "config.json", json.dumps(config, indent=2, ensure_ascii=False))
+        atomic_write_json(self.base / "config.json", config)
 
     # --- Checkpoint ---
 
@@ -30,7 +25,7 @@ class StorageManager:
         return self.base / ".checkpoint.json"
 
     def save_checkpoint(self, cp: Checkpoint) -> None:
-        _atomic_write(
+        atomic_write_text(
             self.checkpoint_path,
             cp.model_dump_json(indent=2, exclude_defaults=True, exclude_none=True),
         )
@@ -46,9 +41,7 @@ class StorageManager:
         return self.base / "failures.jsonl"
 
     def append_failure_event(self, event: dict) -> None:
-        self.base.mkdir(parents=True, exist_ok=True)
-        with self.failures_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+        append_jsonl(self.failures_path, event)
 
     # --- Node directory & metadata ---
 
@@ -62,7 +55,7 @@ class StorageManager:
 
     def write_node(self, path_segments: list[str], node: KnowledgeNode) -> None:
         d = self.ensure_node_dir(path_segments)
-        _atomic_write(d / "_node.json", node.model_dump_json(indent=2, ensure_ascii=False))
+        atomic_write_text(d / "_node.json", node.model_dump_json(indent=2, ensure_ascii=False))
 
     def read_node(self, path_segments: list[str]) -> KnowledgeNode:
         raw = json.loads((self.node_dir(path_segments) / "_node.json").read_text(encoding="utf-8"))
@@ -75,7 +68,7 @@ class StorageManager:
         return self.base / "catalog.json"
 
     def save_catalog(self, tree: KnowledgeTree) -> None:
-        _atomic_write(self.catalog_path, tree.model_dump_json(indent=2, ensure_ascii=False))
+        atomic_write_text(self.catalog_path, tree.model_dump_json(indent=2, ensure_ascii=False))
 
     def load_catalog(self) -> Optional[KnowledgeTree]:
         if not self.catalog_path.exists():
@@ -93,7 +86,7 @@ class StorageManager:
 
     def write_questions(self, path_segments: list[str], qset: QuestionSet) -> None:
         d = self.ensure_node_dir(path_segments)
-        _atomic_write(d / "_questions.json", qset.model_dump_json(indent=2, ensure_ascii=False))
+        atomic_write_text(d / "_questions.json", qset.model_dump_json(indent=2, ensure_ascii=False))
 
     def read_questions(self, path_segments: list[str]) -> QuestionSet:
         raw = json.loads(self.questions_path(path_segments).read_text(encoding="utf-8"))
@@ -114,7 +107,7 @@ class StorageManager:
 
     def write_answer(self, path_segments: list[str], answer: AnswerItem) -> None:
         d = self.answers_dir(path_segments)
-        _atomic_write(d / f"{answer.question_id}.json", answer.model_dump_json(indent=2, ensure_ascii=False))
+        atomic_write_text(d / f"{answer.question_id}.json", answer.model_dump_json(indent=2, ensure_ascii=False))
 
     def read_answer(self, path_segments: list[str], question_id: str) -> AnswerItem:
         raw = json.loads(self.answer_path(path_segments, question_id).read_text(encoding="utf-8"))

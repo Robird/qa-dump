@@ -28,23 +28,24 @@ from api import LLMClient
 from answers import AnswerGenerator
 from catalog import CatalogBuilder
 from exporter import DatasetExporter
+from fs_utils import atomic_write_json
 from models import Checkpoint, Phase, to_slug
 from prompts import get_prompts
 from questions import QuestionGenerator
 from run_paths import QA_TASK_FAMILY, ensure_run_dirs, qa_domains_dir, qa_view_dir, resolve_qa_run_root, system_dir
 from run_metadata import (
-    atomic_write_json,
     build_run_doc,
     build_run_manifest,
     load_run_doc,
     load_run_manifest,
     set_run_status,
     utc_now_iso,
+    validate_run_doc,
     write_root_metadata,
     write_run_manifest,
 )
 from storage import StorageManager
-from task_contracts import QA_VIEW_ID, make_artifact_ref, qa_view_relpath
+from task_contracts import QA_VIEW_ID, make_artifact_ref, qa_view_relpath, task_run_scope
 
 logger = logging.getLogger(__name__)
 
@@ -195,12 +196,29 @@ class MetaCheckpoint:
 
 
 def resolve_run_id(args: argparse.Namespace, out_base: str) -> str:
+    existing_run_doc = load_run_doc(out_base)
+    if existing_run_doc is not None:
+        validate_run_doc(
+            existing_run_doc,
+            task_family=QA_TASK_FAMILY,
+            language=args.language,
+            run_scope=task_run_scope(QA_TASK_FAMILY),
+        )
+        existing_run_id = existing_run_doc.get("run_id")
+        if args.run_id and existing_run_id and existing_run_id != args.run_id:
+            raise ValueError(
+                f"--run-id {args.run_id!r} does not match existing run.json run_id "
+                f"{existing_run_id!r} in {out_base}"
+            )
     if args.run_id:
         return args.run_id
-    basename = os.path.basename(os.path.abspath(out_base.rstrip(os.sep))) or args.language
-    if "--" in basename:
-        return basename.split("--", 1)[1]
-    return basename
+    if existing_run_doc is not None:
+        existing_run_id = existing_run_doc.get("run_id")
+        if existing_run_id:
+            return existing_run_id
+    if args.output_dir:
+        raise ValueError("--run-id is required with --output-dir unless run.json already exists")
+    return "default"
 
 
 def save_run_metadata(out_base: str, run_id: str, args: argparse.Namespace) -> None:
@@ -214,7 +232,7 @@ def save_run_metadata(out_base: str, run_id: str, args: argparse.Namespace) -> N
         task_family=QA_TASK_FAMILY,
         run_id=run_id,
         language=args.language,
-        language_scope="language",
+        run_scope=task_run_scope(QA_TASK_FAMILY),
         status="running",
         created_at=created_at,
         updated_at=updated_at,
@@ -226,7 +244,6 @@ def save_run_metadata(out_base: str, run_id: str, args: argparse.Namespace) -> N
                 "path": str(qa_view_relpath()),
             }
         ],
-        extra_fields={"output_dir": os.path.abspath(out_base)},
     )
     config_doc = {
         "seed_domain": args.seed_domain,
@@ -251,9 +268,6 @@ def save_run_metadata(out_base: str, run_id: str, args: argparse.Namespace) -> N
         build_run_manifest(
             task_family=QA_TASK_FAMILY,
             run_id=run_id,
-            language=args.language,
-            language_scope="language",
-            status="running",
             updated_at=updated_at,
             summary=summary,
             outputs=outputs,
@@ -517,9 +531,6 @@ def update_qa_manifest_and_status(
         build_run_manifest(
             task_family=QA_TASK_FAMILY,
             run_id=run_id,
-            language=language,
-            language_scope="language",
-            status=status,
             updated_at=updated_at,
             summary={
                 "domains_total": domains_total,
@@ -713,7 +724,11 @@ def run_controller(args: argparse.Namespace, base_url: str, api_key: str) -> Non
     lang = args.language
     initial_root = args.output_dir or str(resolve_qa_run_root(lang, args.run_id or "default"))
     prompts = get_prompts(lang)
-    run_id = resolve_run_id(args, initial_root)
+    try:
+        run_id = resolve_run_id(args, initial_root)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(1)
     out_base = args.output_dir or str(resolve_qa_run_root(lang, run_id))
     if not args.resume and has_existing_qa_run_content(out_base):
         print(
