@@ -122,6 +122,23 @@ Sim-Psych 的映射其实更漂亮：
 
 也就是说，Sim-Psych 项目不是独立于 Agentic 训练协议的，它天然适合作为这套协议的高阶训练材料。
 
+### 3.3 `observation / belief / me` 不等于“只能有一个会话线程”
+
+需要特别区分两层概念：
+
+- `observation / belief / me` 是单个语义样本内部的角色拆分
+- runtime session orchestration 是系统在运行时如何调度不同会话实例
+
+也就是说，即使最终协议仍然是 `observation / belief / me`，运行时仍然完全可以采用多会话架构。
+
+一个目前看来很自然的方案是三层：
+
+- `transactional_session`：处理当前任务、当前对话、当前工具结果、当前外显动作
+- `meta_session`：处理状态维护、轨迹分析、偏差检查、目标树与关切场整理
+- `idle_session`：处理空闲期复盘、近未来想象、DMN 类整合、弱规划生成
+
+这三层不是三个不同的 self，而是共享同一语义真相层的不同工作面。
+
 
 ## 4. 两阶段设计与 Agentic 协议如何对齐
 
@@ -250,6 +267,13 @@ Sim-Psych 的映射其实更漂亮：
 
 以及内部的 `opaque_payload` / `structured_region`。
 
+如果未来采用多会话架构，还应允许加入较轻量的 orchestration metadata，例如：
+
+- `session_layer`
+- `write_authority`
+- `wake_reason`
+- `handoff_target`
+
 ### 6.3 Text projection
 
 最后才是给人阅读、给现有训练脚本兼容的 prompt 文本。
@@ -320,6 +344,24 @@ Agentic 协议设计很强，但它也会反过来诱惑我们过早地把所有
 
 如果一份样本的结构太复杂，以至于人很难看懂，那它未必是更好的第一阶段样本。
 
+### 风险 3：多会话拆分后出现 split-brain
+
+如果未来真的采用：
+
+- 事务性会话
+- 元会话
+- idle 会话
+
+那么必须让它们共享同一个 canonical semantic state。
+
+否则最常见的失败方式不是“不会想”，而是：
+
+- 三个会话各自记住不同的前情
+- 三个会话各自重写不同版本的目标树
+- 最终系统失去一致的自我连续性
+
+所以多会话架构成立的前提，不是多开几个对话框，而是先把语义真相层和写权限边界设计清楚。
+
 
 ## 9. 当前最值得写进原则的一句话
 
@@ -335,6 +377,8 @@ Agentic 协议设计很强，但它也会反过来诱惑我们过早地把所有
 - 在 `Shared Derived-Data Foundation` 里加入 semantic export / protocol projection 的规划
 - 在 `RecallDeriveTask` 里加入 early agentic target 的说明
 - 在 Sim-Psych 相关文档里加入 `observation / belief / me` 的映射章节
+- 单独新增一份 `sim-psych-fuzzy-state-machine` 草稿，定义 `turn_type / state blocks / transition contract`
+- 补一份 `session orchestration / write authority` 草案，明确 transactional / meta / idle 的共享状态关系
 - 单独新增一份 `semantic-sample-schema` 规格草案
 
 这样未来无论是 QA 课程学习路线，还是 Sim-Psych 人格训练路线，都能更自然地接入同一套后训练协议。
