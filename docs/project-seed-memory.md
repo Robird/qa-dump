@@ -61,6 +61,20 @@ This run should be treated as secondary context unless a future session confirms
 
 At the time this memory file was written, there were `22` `.checkpoint.json` files under `output/zh/runs/`.
 
+### 2.4 Runtime environment
+
+The active development environment is expected to have these variables set:
+
+- `DEEPSEEK_BASE_URL`
+- `DEEPSEEK_API_KEY`
+
+Treat the pipeline as runnable against the live DeepSeek API by default.
+
+Implication:
+
+- when validating QA generation or other real task flows, prefer actual end-to-end execution when it is useful
+- do not assume the repo is limited to mock-only or dry-run-only development
+
 
 ## 3. The Most Important Design Decisions So Far
 

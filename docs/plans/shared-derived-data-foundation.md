@@ -59,7 +59,7 @@ The framework should own steps 1, 3, 6, and 7, while task plugins should primari
 
 ## 4. Desired Interface
 
-Suggested task plugin shape:
+Possible future task plugin shape:
 
 ```python
 class DerivedTask:
@@ -79,6 +79,17 @@ class DerivedTask:
 ```
 
 This is only a planning sketch, not a fixed API.
+
+For v1, we should stop earlier and only share the run lifecycle shell:
+
+- run-root setup
+- config/lineage/run metadata writes
+- compact run-state persistence
+- completion/failure manifest updates
+
+Task-local source discovery, item identity, prompt building, export logic,
+and validation should remain task-specific until we have at least one more
+derived task that really matches the same execution model.
 
 
 ## 5. Source Discovery
@@ -122,26 +133,40 @@ We want derived-data generation to be resumable without disturbing the base corp
 
 ## 7. Output Layout
 
-We should use a predictable on-disk layout.
+We should use a predictable on-disk layout built around first-class task runs.
 
-One possible shape:
+Recommended shape:
 
 ```text
-output/<lang>/runs/<run_id>/
-  exports/
-  derived/
-    bloom_augment/
-    recall_derive/
-    reasoning_compress/
+output/
+  shared/
+    runs/
+      policy_records--pr-1/
+  zh/
+    runs/
+      qa_corpus--qa-1/
+      help_gate_augment--hg-1/
 ```
 
-Inside each derived task directory:
+Each run root should use the same broad categories:
 
-- item outputs
-- task checkpoint
-- task config
-- manifest
-- optional aggregate export
+```text
+<task_family>--<run_id>/
+  run.json
+  config.json
+  lineage.json
+  manifest.json
+  work/
+  artifacts/
+  views/
+  system/
+```
+
+Important rules:
+
+- `artifacts/` holds canonical task outputs
+- `views/` holds rebuildable projections and exports
+- downstream runs reference upstream runs in `lineage.json`; they are not nested physically
 
 
 ## 8. Parallelism Model
