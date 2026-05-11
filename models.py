@@ -50,22 +50,28 @@ class AnswerItem(BaseModel):
     node_path: str = ""
 
 
+class DeadLetterItem(BaseModel):
+    stage: str
+    item_id: str
+    node_path: str = ""
+    question_id: str = ""
+    attempts: int = 0
+    error_type: str = ""
+    error_message: str = ""
+    last_failed_at: str = ""
+
+
 class Checkpoint(BaseModel):
     phase: Phase
+    completed: bool = False
 
     # Phase 1 state
     knowledge_tree: Optional[KnowledgeTree] = None
-    bfs_queue: list[list[str]] = Field(default_factory=list)
-    completed_nodes: list[str] = Field(default_factory=list)
-    current_depth: int = 0
+    catalog_frontier: list[list[str]] = Field(default_factory=list)
 
-    # Phase 2 state
-    leaf_queue: list[str] = Field(default_factory=list)
-    questions_done: list[str] = Field(default_factory=list)
-
-    # Phase 3 state
-    answer_queue: list[dict] = Field(default_factory=list)
-    answers_done: list[str] = Field(default_factory=list)
+    # Failure isolation state
+    question_dead_letters: list[DeadLetterItem] = Field(default_factory=list)
+    answer_dead_letters: list[DeadLetterItem] = Field(default_factory=list)
 
 
 def to_slug(name: str) -> str:

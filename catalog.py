@@ -11,7 +11,6 @@ from models import (
     get_node_by_path,
     to_slug,
 )
-from prompts import get_prompts
 from storage import StorageManager
 
 logger = logging.getLogger(__name__)
@@ -35,24 +34,19 @@ class CatalogBuilder:
     def run(self, seed_domain: str) -> KnowledgeTree:
         if self.checkpoint and self.checkpoint.knowledge_tree:
             tree = self.checkpoint.knowledge_tree
-            queue = deque(tuple(p) for p in self.checkpoint.bfs_queue)
-            completed = set(self.checkpoint.completed_nodes)
+            queue = deque(tuple(p) for p in self.checkpoint.catalog_frontier)
         else:
             root = self._discover_root(seed_domain)
             tree = KnowledgeTree(domain=seed_domain, root=root)
             queue: deque[tuple[str, ...]] = deque()
             for child in root.children:
                 queue.append((child.slug,))
-            completed: set[str] = set()
-            self._persist(tree, queue, completed, 0)
+            self._persist(tree, queue)
             self.storage.write_node([], root)
 
         while queue:
             path = queue.popleft()
             path_str = "/".join(path)
-
-            if path_str in completed:
-                continue
 
             node = get_node_by_path(tree.root, list(path))
             current_depth = len(path)
@@ -73,10 +67,9 @@ class CatalogBuilder:
                 else:
                     pass  # node stays as leaf
 
-            completed.add(path_str)
             node_segments = list(path)
             self.storage.write_node(node_segments, node)
-            self._persist(tree, queue, completed, current_depth)
+            self._persist(tree, queue)
 
         self.storage.save_catalog(tree)
         return tree
@@ -121,14 +114,10 @@ class CatalogBuilder:
             ))
         return nodes
 
-    def _persist(
-        self, tree: KnowledgeTree, queue: deque, completed: set, depth: int
-    ) -> None:
+    def _persist(self, tree: KnowledgeTree, queue: deque) -> None:
         cp = Checkpoint(
             phase=Phase.CATALOG_DISCOVERY,
             knowledge_tree=tree,
-            bfs_queue=[list(p) for p in queue],
-            completed_nodes=sorted(completed),
-            current_depth=depth,
+            catalog_frontier=[list(p) for p in queue],
         )
         self.storage.save_checkpoint(cp)

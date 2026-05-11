@@ -95,6 +95,14 @@ def parse_args() -> argparse.Namespace:
         help="Maximum concurrent top-level domain workers",
     )
     parser.add_argument(
+        "--question-max-attempts", type=int, default=3,
+        help="Maximum attempts per leaf before question generation dead-letters it",
+    )
+    parser.add_argument(
+        "--answer-max-attempts", type=int, default=3,
+        help="Maximum attempts per question before answer generation dead-letters it",
+    )
+    parser.add_argument(
         "--fail-fast", action="store_true",
         help="Stop all workers as soon as any worker exits with an error",
     )
@@ -199,6 +207,8 @@ def save_run_metadata(out_base: str, run_id: str, args: argparse.Namespace) -> N
             "model_catalog": args.model_catalog,
             "model_questions": args.model_questions,
             "model_answers": args.model_answers,
+            "question_max_attempts": args.question_max_attempts,
+            "answer_max_attempts": args.answer_max_attempts,
             "max_workers": args.max_workers,
         },
     )
@@ -212,7 +222,7 @@ class DomainScanState:
 
     @property
     def is_complete(self) -> bool:
-        return self.checkpoint.phase == Phase.ANSWER_GENERATION and not self.checkpoint.answer_queue
+        return self.checkpoint.completed
 
     def as_domain_entry(self) -> dict:
         return {
@@ -238,19 +248,20 @@ def scan_domain_checkpoints(out_base: str) -> dict[str, DomainScanState]:
     for child in sorted(base.iterdir()):
         if not child.is_dir() or child.name == "exports" or child.name.startswith("."):
             continue
-        checkpoint_path = child / ".checkpoint.json"
-        if not checkpoint_path.exists():
+        storage = StorageManager(str(child))
+        try:
+            checkpoint = storage.load_checkpoint()
+        except (json.JSONDecodeError, OSError, ValueError) as exc:
+            logger.warning("Skipping unreadable checkpoint at %s: %s", storage.checkpoint_path, exc)
             continue
 
-        try:
-            checkpoint = Checkpoint(**json.loads(checkpoint_path.read_text(encoding="utf-8")))
-        except (json.JSONDecodeError, OSError, ValueError) as exc:
-            logger.warning("Skipping unreadable checkpoint at %s: %s", checkpoint_path, exc)
+        if checkpoint is None:
             continue
 
         domain_name = child.name
-        if checkpoint.knowledge_tree is not None:
-            domain_name = checkpoint.knowledge_tree.domain or domain_name
+        tree = checkpoint.knowledge_tree or storage.load_catalog()
+        if tree is not None:
+            domain_name = tree.domain or domain_name
 
         scan[child.name] = DomainScanState(
             slug=child.name,
@@ -372,6 +383,10 @@ def build_worker_command(
         args.model_answers,
         "--temperature",
         str(args.temperature),
+        "--question-max-attempts",
+        str(args.question_max_attempts),
+        "--answer-max-attempts",
+        str(args.answer_max_attempts),
         "--max-workers",
         "1",
     ]
@@ -384,7 +399,12 @@ def build_worker_command(
     return cmd
 
 
-def export_completed_domains(out_base: str, run_id: str, language: str) -> dict:
+def export_completed_domains(
+    out_base: str,
+    run_id: str,
+    language: str,
+    update_run_bundle: bool,
+) -> dict:
     exporter = DatasetExporter(os.path.join(out_base, "exports"), run_id)
     domain_summaries: list[dict] = []
     for slug, state in sorted(scan_domain_checkpoints(out_base).items()):
@@ -394,7 +414,9 @@ def export_completed_domains(out_base: str, run_id: str, language: str) -> dict:
         summary = export_domain_if_complete(storage, exporter, language)
         if summary is not None:
             domain_summaries.append(summary)
-    return exporter.export_run(domain_summaries, language)
+    if update_run_bundle:
+        return exporter.export_run(domain_summaries, language)
+    return {"domains": domain_summaries}
 
 
 def terminate_processes(processes: list[subprocess.Popen]) -> None:
@@ -436,6 +458,10 @@ def print_resume_hint(args: argparse.Namespace, heading: str = "Interrupted") ->
         cmd.extend(["--model-answers", args.model_answers])
     if args.temperature != 0.3:
         cmd.extend(["--temperature", str(args.temperature)])
+    if args.question_max_attempts != 3:
+        cmd.extend(["--question-max-attempts", str(args.question_max_attempts)])
+    if args.answer_max_attempts != 3:
+        cmd.extend(["--answer-max-attempts", str(args.answer_max_attempts)])
     if args.run_id:
         cmd.extend(["--run-id", args.run_id])
     if args.max_workers != 1:
@@ -486,7 +512,7 @@ def run_domain(
                 checkpoint=checkpoint,
             )
             tree = builder.run(seed_domain)
-        checkpoint = Checkpoint(phase=Phase.QUESTION_GENERATION, knowledge_tree=tree)
+        checkpoint = Checkpoint(phase=Phase.QUESTION_GENERATION)
         storage.save_checkpoint(checkpoint)
 
     # Phase 2: Question Generation
@@ -496,6 +522,7 @@ def run_domain(
             qgen = QuestionGenerator(
                 llm=client,
                 count=args.questions_per_node,
+                max_attempts=args.question_max_attempts,
                 storage=storage,
                 prompts=prompts,
                 checkpoint=checkpoint,
@@ -505,11 +532,12 @@ def run_domain(
     checkpoint = storage.load_checkpoint()
 
     # Phase 3: Answer Generation
-    if checkpoint and checkpoint.phase == Phase.ANSWER_GENERATION:
+    if checkpoint and checkpoint.phase == Phase.ANSWER_GENERATION and not checkpoint.completed:
         print("  Phase 3 — answer generation")
         with closing(make_client(base_url, api_key, args.model_answers)) as client:
             agen = AnswerGenerator(
                 llm=client,
+                max_attempts=args.answer_max_attempts,
                 storage=storage,
                 prompts=prompts,
                 checkpoint=checkpoint,
@@ -525,11 +553,28 @@ def export_domain_if_complete(
     language: str,
 ) -> Optional[dict]:
     checkpoint = storage.load_checkpoint()
-    if checkpoint is None or checkpoint.knowledge_tree is None:
+    if checkpoint is None:
         return None
-    if checkpoint.phase != Phase.ANSWER_GENERATION or checkpoint.answer_queue:
+    tree = storage.load_catalog()
+    if tree is None or not checkpoint.completed:
         return None
-    return exporter.export_domain(storage, checkpoint.knowledge_tree, language)
+    return exporter.export_domain(storage, tree, language, checkpoint=checkpoint)
+
+
+def summarize_dead_letters(out_base: str) -> list[dict]:
+    summaries: list[dict] = []
+    for slug, state in sorted(scan_domain_checkpoints(out_base).items()):
+        question_count = len(state.checkpoint.question_dead_letters)
+        answer_count = len(state.checkpoint.answer_dead_letters)
+        if not question_count and not answer_count:
+            continue
+        summaries.append({
+            "slug": slug,
+            "name": state.name,
+            "question_dead_letters": question_count,
+            "answer_dead_letters": answer_count,
+        })
+    return summaries
 
 
 # ---------------------------------------------------------------------------
@@ -565,7 +610,7 @@ def run_controller(args: argparse.Namespace, base_url: str, api_key: str) -> Non
         if dom["slug"] in done_slugs:
             print(f"\n[{i + 1}/{len(domains)}] {dom['name']} — already done, skipping")
     if done_slugs:
-        export_completed_domains(out_base, run_id, lang)
+        export_completed_domains(out_base, run_id, lang, update_run_bundle=False)
 
     max_workers = max(1, args.max_workers)
     active: list[tuple[subprocess.Popen, dict]] = []
@@ -614,14 +659,25 @@ def run_controller(args: argparse.Namespace, base_url: str, api_key: str) -> Non
                     )
                     continue
                 print(f"Worker finished: {domain['name']} ({domain['slug']})")
-                export_completed_domains(out_base, run_id, lang)
+                export_completed_domains(out_base, run_id, lang, update_run_bundle=False)
             active = still_active
     except KeyboardInterrupt:
         terminate_processes([proc for proc, _ in active])
         print_resume_hint(args)
         raise SystemExit(1)
 
-    export_completed_domains(out_base, run_id, lang)
+    export_completed_domains(out_base, run_id, lang, update_run_bundle=True)
+    dead_letter_summaries = summarize_dead_letters(out_base)
+    if dead_letter_summaries:
+        print("\nCompleted with dead-lettered items:")
+        for summary in dead_letter_summaries:
+            print(
+                "  "
+                f"- {summary['name']} ({summary['slug']}): "
+                f"question_dead_letters={summary['question_dead_letters']}, "
+                f"answer_dead_letters={summary['answer_dead_letters']}"
+            )
+
     if worker_failures:
         print("\nRun finished with worker failures:", file=sys.stderr)
         for domain, code in worker_failures:
