@@ -29,7 +29,7 @@ from answers import AnswerGenerator
 from catalog import CatalogBuilder
 from exporter import DatasetExporter
 from fs_utils import atomic_write_json
-from models import Checkpoint, Phase, to_slug
+from models import CategoryListResponse, Checkpoint, Phase, to_slug
 from prompts import get_prompts
 from questions import QuestionGenerator
 from run_paths import QA_TASK_FAMILY, ensure_run_dirs, qa_domains_dir, qa_view_dir, resolve_qa_run_root, system_dir
@@ -158,14 +158,20 @@ def discover_domains(client: LLMClient, prompts: dict) -> list[dict]:
         {"role": "system", "content": prompts["domain_system"]},
         {"role": "user", "content": prompts["domain_user"]},
     ]
-    result = client.chat_json(messages)
+    result = client.chat_structured(
+        messages,
+        output_model=CategoryListResponse,
+        tool_name="submit_domain_categories",
+        tool_description="Submit the major top-level knowledge domains for the QA run.",
+        temperature=0.3,
+    )
     domains = []
-    for item in result.get("categories", []):
-        slug = item.get("slug", "") or to_slug(item.get("name", ""))
+    for item in result.categories:
+        slug = item.slug or to_slug(item.name)
         domains.append({
-            "name": item.get("name", "Untitled"),
+            "name": item.name or "Untitled",
             "slug": slug,
-            "description": item.get("description", ""),
+            "description": item.description,
         })
     logger.info("Discovered %d top-level domains", len(domains))
     return domains

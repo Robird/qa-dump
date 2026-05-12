@@ -4,7 +4,7 @@ import re
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Phase(str, Enum):
@@ -39,6 +39,42 @@ class QuestionItem(BaseModel):
 class QuestionSet(BaseModel):
     node_path: str = ""
     questions: list[QuestionItem] = Field(default_factory=list)
+
+
+# These models describe structured LLM submissions for synthetic-data
+# generation tasks. Keep them explicit and typed so the tool-call contract
+# stays stable as we expand tasks or providers.
+class CategoryCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    slug: str = ""
+    description: str = ""
+
+
+class CategoryListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    categories: list[CategoryCandidate] = Field(default_factory=list)
+
+
+class QuestionCandidate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str
+    bloom_level: str | list[str] = ""
+
+
+class QuestionListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    questions: list[QuestionCandidate] = Field(default_factory=list)
+
+
+class AnswerResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    answer: str
 
 
 class AnswerItem(BaseModel):

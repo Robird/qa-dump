@@ -40,6 +40,27 @@ EN_COUNTERPARTY_PRONOUN_RE = re.compile(
     r"\b(?:you|your|he|she|him|his|her|hers|himself|herself|they|them|their|theirs|themself|themselves)\b"
 )
 
+ZH_BELIEF_DECISION_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"我(?:现在)?决定"),
+    re.compile(r"还是先"),
+    re.compile(r"我(?:得|要|需要|必须)先"),
+    re.compile(r"我(?:得|要|需要|必须)(?:跟|和).{0,12}(?:说清|讲清|说明|明确)"),
+    re.compile(r"先(?:跟|和).{0,12}(?:说清|讲清|说明|明确)"),
+    re.compile(r"(?:我来处理|这就处理|现在接下|马上处理|立刻处理)"),
+    re.compile(r"(?:不接这个请求|现在不接|先不接)"),
+    re.compile(r"(?:晚点|之后|回头|稍后|改天|等我).{0,8}(?:处理|再说|再聊|再帮|再回)"),
+    re.compile(r"(?:收到|知道了|先回应|先答一句|先说一声)"),
+)
+
+EN_BELIEF_DECISION_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bi (?:decide|decided|am deciding)\b", flags=re.IGNORECASE),
+    re.compile(r"\b(?:first )?i(?:'ll| will)\b", flags=re.IGNORECASE),
+    re.compile(r"\blet me\b", flags=re.IGNORECASE),
+    re.compile(r"\bi (?:need|have) to (?:reply|respond|tell|say no|set|handle|take)\b", flags=re.IGNORECASE),
+    re.compile(r"\b(?:got it|noted|message received)\b", flags=re.IGNORECASE),
+    re.compile(r"\b(?:later|tomorrow|tonight|after this)\b.{0,16}\b(?:handle|reply|help|deal with|get back to)\b", flags=re.IGNORECASE),
+)
+
 
 class PolicyTextGenerationError(LLMResponseError):
     pass
@@ -58,7 +79,7 @@ class PolicyTextGenerator:
         *,
         language: str,
         temperature: float = 0.8,
-        max_tokens: int = 300,
+        max_tokens: int | None = None,
     ):
         self.llm = llm
         self.language = language
@@ -90,12 +111,20 @@ class PolicyTextGenerator:
             task.source_policy.record_id,
             _preview_text(messages[1]["content"], limit=1000),
         )
-        raw = self.llm.chat_json_result(
+        # Keep generator and judge on the same structured-output protocol.
+        # We intentionally leave max_tokens unset for this synthetic-data path:
+        # on DeepSeek, quality and complete tool submission matter more than
+        # token thrift, and hard caps can truncate the tool call entirely.
+        raw = self.llm.chat_structured_result(
             messages,
+            output_model=PolicyTextRealization,
+            tool_name="submit_policy_text_realization",
+            tool_description="Submit the realized belief and thinking text for one policy_text record.",
+            tool_choice=None,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
         )
-        realization = PolicyTextRealization(**raw.data)
+        realization = raw.payload
         logger.debug(
             "PolicyTextGenerator raw realization for %s: belief=%r thinking=%r",
             task.source_policy.record_id,
@@ -215,6 +244,15 @@ class PolicyTextGenerator:
                     "belief_not_first_person",
                     "belief should be first-person in en",
                     "Rewrite belief in first person using I/me/my.",
+                    field="belief",
+                )
+            )
+        if belief and self._belief_decision_leak_hits(belief):
+            issues.append(
+                self._issue(
+                    "belief_decision_leak",
+                    "belief contains action/decision content that belongs in thinking",
+                    "Keep belief as pre-decision background only; move any decision, next-step, or response conclusion wording into thinking.",
                     field="belief",
                 )
             )
@@ -426,18 +464,27 @@ class PolicyTextGenerator:
             )
         return tuple(lines)
 
+    def _belief_decision_leak_hits(self, text: str) -> tuple[str, ...]:
+        patterns = ZH_BELIEF_DECISION_LEAK_PATTERNS if self.language == "zh" else EN_BELIEF_DECISION_LEAK_PATTERNS
+        return tuple(pattern.pattern for pattern in patterns if pattern.search(text))
+
     def _system_prompt(self) -> str:
         if self.language == "zh":
             return (
                 "你要把结构化的社交决策记录，改写成自然、简短、可读的中文文本。"
-                "输出必须是 JSON 对象，且只包含 belief 和 thinking 两个字符串字段。"
-                "belief 是第一人称已知背景；thinking 是内部独白中的简短理由和结论，不是发给对方的消息。"
+                "最终结构化结果必须通过提供的函数工具提交。"
+                "把它理解成两个时间切片：belief 是做出回应结论之前就已经成立的第一人称背景快照；"
+                "thinking 才是此刻形成的内部独白、简短理由和行动结论，不是发给对方的消息。"
+                "不要在 belief 里提前写我决定什么、我先做什么、我之后怎么处理。"
                 "除提供的 counterparty mention 外，不要输出长链路推理、字段名或额外模板标签。"
             )
         return (
             "Rewrite a structured social decision record into short natural text."
-            " Return a JSON object with only belief and thinking."
-            " belief is first-person known context; thinking is internal monologue with a short reason plus conclusion, not a direct message to the counterparty."
+            " Submit the final structured result through the provided function tool."
+            " Treat the two fields as two time slices: belief is the first-person pre-decision context snapshot,"
+            " while thinking is the in-the-moment internal monologue with a short reason plus action conclusion,"
+            " not a direct message to the counterparty."
+            " Do not put what I decide or what I will do next into belief."
             " Except for the provided counterparty mention, do not expose schema labels or long chain-of-thought."
         )
 
@@ -450,34 +497,42 @@ class PolicyTextGenerator:
     ) -> str:
         retry_block = self._retry_feedback_block(retry_feedback)
         if self.language == "zh":
-            branch_rule = (
-                "结论必须明确表示：现在不接下处理。"
+            thinking_target = (
+                "thinking 的结论必须明确表示：现在不接下处理。"
                 if not intent_spec.will_help_now
-                else "结论必须明确表示：现在接下并处理。"
+                else "thinking 的结论必须明确表示：现在接下并处理。"
             )
             intent_cue_lines = "".join(self._intent_cue_prompt_lines(intent_spec))
             return (
                 f"Language: {self.language}\n"
                 f"decision: {intent_spec.decision}\n"
-                f"response_intent: {intent_spec.response_intent}\n"
-                f"will_help_now: {json.dumps(intent_spec.will_help_now)}\n"
-                f"intent_description: {intent_spec.prompt_description_zh}\n"
-                f"branch_rule: {branch_rule}\n\n"
+                f"thinking_response_intent: {intent_spec.response_intent}\n"
+                f"thinking_will_help_now: {json.dumps(intent_spec.will_help_now)}\n"
+                f"thinking_intent_description: {intent_spec.prompt_description_zh}\n"
+                f"thinking_target: {thinking_target}\n\n"
                 "Realization input:\n"
                 f"{json.dumps(realization_input.model_dump(), ensure_ascii=False, indent=2)}\n\n"
                 "Requirements:\n"
+                # This synthetic-data task intentionally keeps `belief` and
+                # `thinking` semantically separated: belief teaches stable
+                # background framing, while thinking teaches explicit
+                # decision/output style.
                 "- belief 必须是第一人称，基于 realization input 自然表达，不要像字段翻译。\n"
                 "- belief 必须自然使用 counterparty_mention.first_mention_name 或 counterparty_mention.canonical_name。\n"
                 "- belief 应自然提到关系背景和我当前状态，不必覆盖每个字段。\n"
+                "- belief 只写做出回应结论之前就已经成立的背景与主观状态，像“我为什么会走到这个判断前”的静态快照。\n"
+                "- belief 可以写“我现在精力低、时间紧、不适合马上处理”这类背景，但不要写“所以我决定…… / 还是先…… / 我先…… / 我之后再……”这类行动结论。\n"
+                "- 所有“我接下来怎么做”“我最后怎么定”的内容，只能放进 thinking。\n"
                 "- thinking 必须是 1-3 句短句，给出可见理由和行动结论。\n"
                 "- thinking 必须自然使用 counterparty_mention.first_mention_name 或 counterparty_mention.canonical_name。\n"
                 "- thinking 是内部独白，不要写成发给 counterparty 的直接消息。\n"
+                "- thinking 才承担 response_intent、will_help_now 和结论落点，不要把这些分支信号扩散进 belief。\n"
                 "- counterparty 必须用提供的姓名或 mention 指代；宁可重复姓名，也不要改用代词或泛称。\n"
                 "- 如果再次提到 counterparty，继续重复姓名，例如“叶怀和……叶怀和……”；不要把后续提及改成“他/她/ta”。\n"
                 f"- 这是硬性校验项：只要再次提到 counterparty，就继续写 {realization_input.counterparty_mention.canonical_name} 或 {realization_input.counterparty_mention.first_mention_name}，绝对不要写成他、她、他们、她们、ta、TA。\n"
                 "- 不要用 对方、这个人、那个人 这类泛称替代名字。\n"
                 "- 不要用 他、她、他们、她们、ta、TA 这类代词指代 counterparty。\n"
-                "- thinking 必须符合 response_intent，不要只满足二分类分支。\n"
+                "- thinking 必须符合 thinking_response_intent，不要只满足二分类分支。\n"
                 "- reason_tags 只是可参考线索，不是逐条复述清单。\n"
                 "- 不要编造名字、性别、具体任务细节或场景细节。\n"
                 f"{intent_cue_lines}"
@@ -485,39 +540,43 @@ class PolicyTextGenerator:
                 f"- help_now 类表达应包含明确立即帮忙感：{', '.join(IMMEDIATE_HELP_CUES_ZH)}。\n"
                 "- 除提供的 counterparty mention 外，不要输出原始字段名，不要写成长链路推理。\n"
                 f"{retry_block}"
-                "- Return JSON only.\n"
+                "- 只通过提供的函数工具提交最终结构化结果，不要在正文里重复结构化字段。\n"
             )
 
         response_rule = (
-            "The agent should clearly indicate taking this on now."
+            "thinking should clearly indicate taking this on now."
             if intent_spec.will_help_now
-            else "The agent should clearly indicate not taking this on right now."
+            else "thinking should clearly indicate not taking this on right now."
         )
         intent_cue_lines = "".join(self._intent_cue_prompt_lines(intent_spec))
         return (
             f"Language: {self.language}\n"
             f"decision: {intent_spec.decision}\n"
-            f"response_intent: {intent_spec.response_intent}\n"
-            f"will_help_now: {json.dumps(intent_spec.will_help_now)}\n"
-            f"intent_description: {intent_spec.prompt_description_en}\n"
-            f"rule: {response_rule}\n\n"
+            f"thinking_response_intent: {intent_spec.response_intent}\n"
+            f"thinking_will_help_now: {json.dumps(intent_spec.will_help_now)}\n"
+            f"thinking_intent_description: {intent_spec.prompt_description_en}\n"
+            f"thinking_target: {response_rule}\n\n"
             "Realization input:\n"
             f"{json.dumps(realization_input.model_dump(), ensure_ascii=False, indent=2)}\n\n"
             "Requirements:\n"
             "- belief must be first-person and grounded in the realization input.\n"
             "- belief must naturally use counterparty_mention.first_mention_name or counterparty_mention.canonical_name.\n"
             "- belief should mention relationship context and current state naturally.\n"
+            "- belief should stay in the pre-decision frame: only background facts and subjective state that are already true before the conclusion lands.\n"
+            "- belief may say things like low energy, time pressure, or not being in a good state to handle this now, but it must not say what I decide, what I will do next, or when I will reply.\n"
+            "- Any next-step, branch outcome, or response conclusion belongs only in thinking.\n"
             "- thinking must be 1-3 short sentences.\n"
             "- thinking should give a visible reason and action conclusion.\n"
             "- thinking must naturally use counterparty_mention.first_mention_name or counterparty_mention.canonical_name.\n"
             "- thinking is internal monologue, not a direct message to the counterparty.\n"
+            "- thinking is the only field that should verbalize thinking_response_intent, thinking_will_help_now, and the final action direction.\n"
             "- Use the provided name or mention for the counterparty; repetition is better than pronouns or generic labels.\n"
             "- If you mention the counterparty again later, repeat the same provided name again instead of switching to a pronoun.\n"
             f"- Hard validation rule: every later counterparty mention must repeat exactly {realization_input.counterparty_mention.canonical_name} or {realization_input.counterparty_mention.first_mention_name}, never a pronoun.\n"
             "- Do not refer to the counterparty as the other person, this person, or that person.\n"
             "- Do not address the counterparty as you or your.\n"
             "- Do not use he, she, him, his, her, they, them, their, or similar pronouns for the counterparty.\n"
-            "- thinking should reflect the given response_intent, not just the binary branch bit.\n"
+            "- thinking should reflect the given thinking_response_intent, not just the binary branch bit.\n"
             "- reason_tags are hints, not a checklist.\n"
             "- Do not invent names, genders, exact tasks, or scene details.\n"
             f"{intent_cue_lines}"
@@ -525,7 +584,7 @@ class PolicyTextGenerator:
             f"- help-now phrasing should sound immediate, for example: {', '.join(IMMEDIATE_HELP_CUES_EN)}.\n"
             "- Do not output raw field names or long hidden reasoning.\n"
             f"{retry_block}"
-            "- Return JSON only.\n"
+            "- Submit the final structured result only through the provided function tool.\n"
         )
 
     def _retry_feedback_block(self, retry_feedback: tuple[PolicyTextIssue, ...]) -> str:

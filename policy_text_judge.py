@@ -10,7 +10,7 @@ from api import LLMClient, LLMResponseError
 from policy_text_issues import PolicyTextIssue, summarize_issue_messages
 from policy_text_models import PolicyTextRealization
 from policy_text_preparation import PreparedPolicyTextTask
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
 from tenacity import (
     before_sleep_log,
     retry,
@@ -20,11 +20,6 @@ from tenacity import (
 )
 
 logger = logging.getLogger(__name__)
-
-# The judge needs enough output budget for reasoning plus the final tool call.
-# On DeepSeek, budgets that are too small can end in finish_reason="length"
-# before the model emits tool arguments, which looks like a missing tool call.
-DEFAULT_POLICY_TEXT_JUDGE_MAX_TOKENS = 1600
 
 
 class PolicyTextSemanticRejection(LLMResponseError):
@@ -95,7 +90,7 @@ class PolicyTextSemanticJudge:
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=20),
-        retry=retry_if_exception_type(ValidationError),
+        retry=retry_if_exception_type(LLMResponseError),
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )
     def _request_verdict(
@@ -108,12 +103,16 @@ class PolicyTextSemanticJudge:
         # tool arguments, not assistant prose. DeepSeek rejects explicit
         # function-style tool_choice on some models, but still accepts tool calls
         # when we omit the field and let the model choose.
-        raw = self.llm.chat_tool_call_result(
+        # We intentionally leave max_tokens unset here. For synthetic-data
+        # generation, judge reliability is more important than token thrift, and
+        # small caps can cause finish_reason="length" before the tool call lands.
+        raw = self.llm.chat_structured_result(
             messages,
-            tool=self._tool_spec(),
+            output_model=PolicyTextJudgeVerdict,
+            tool_name=self.TOOL_NAME,
+            tool_description="Submit the final semantic judgment for one policy_text candidate.",
             tool_choice=None,
             temperature=0.0,
-            max_tokens=DEFAULT_POLICY_TEXT_JUDGE_MAX_TOKENS,
         )
         logger.debug(
             "PolicyTextSemanticJudge tool result for %s: tool=%s content=%r reasoning=%r args=%s",
@@ -121,17 +120,9 @@ class PolicyTextSemanticJudge:
             raw.tool_name,
             _preview_text(raw.content, limit=220) if raw.content else "",
             _preview_text(raw.reasoning_content, limit=220) if raw.reasoning_content else "",
-            raw.arguments,
+            raw.payload.model_dump(),
         )
-        try:
-            return PolicyTextJudgeVerdict.model_validate(raw.arguments)
-        except ValidationError:
-            logger.warning(
-                "PolicyTextSemanticJudge received invalid tool arguments for %s: %s",
-                record_id,
-                raw.arguments,
-            )
-            raise
+        return raw.payload
 
     def _system_prompt(self) -> str:
         return (
@@ -232,48 +223,6 @@ class PolicyTextSemanticJudge:
         ):
             return "semantic_alignment"
         return "semantic_other"
-
-    @classmethod
-    def _tool_spec(cls) -> dict[str, object]:
-        return {
-            "type": "function",
-            "function": {
-                "name": cls.TOOL_NAME,
-                "description": "Submit the final semantic judgment for one policy_text candidate.",
-                "parameters": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "pass_verdict": {
-                            "type": "boolean",
-                            "description": "Whether the candidate is reliable overall.",
-                        },
-                        "score": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": 5,
-                            "description": "Overall quality score from 0 to 5.",
-                        },
-                        "issues": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Short concrete problems found in the candidate.",
-                        },
-                        "repair_instructions": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Short concrete rewrite instructions for the next retry.",
-                        },
-                    },
-                    "required": [
-                        "pass_verdict",
-                        "score",
-                        "issues",
-                        "repair_instructions",
-                    ],
-                },
-            },
-        }
 
 def _preview_text(text: str, *, limit: int) -> str:
     compact = re.sub(r"\s+", " ", text).strip()

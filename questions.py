@@ -9,6 +9,7 @@ from models import (
     Checkpoint,
     DeadLetterItem,
     Phase,
+    QuestionListResponse,
     QuestionItem,
     QuestionSet,
     collect_leaves,
@@ -69,7 +70,13 @@ class QuestionGenerator:
                 )},
             ]
             try:
-                result = self.llm.chat_json(messages)
+                result = self.llm.chat_structured(
+                    messages,
+                    output_model=QuestionListResponse,
+                    tool_name="submit_questions",
+                    tool_description="Submit generated assessment questions for the requested knowledge topic.",
+                    temperature=0.3,
+                )
                 questions = self._parse_questions(result, path_str)
                 qset = QuestionSet(node_path=path_str, questions=questions)
                 self.storage.write_questions(path_segments, qset)
@@ -88,18 +95,18 @@ class QuestionGenerator:
             return ", ".join(str(v) for v in val)
         return str(val) if val else ""
 
-    def _parse_questions(self, result: dict, node_path: str) -> list[QuestionItem]:
+    def _parse_questions(self, result: QuestionListResponse, node_path: str) -> list[QuestionItem]:
         items: list[QuestionItem] = []
         seen_texts: set[str] = set()
-        for q_data in result.get("questions", []):
-            text = str(q_data.get("text", "")).strip()
+        for q_data in result.questions:
+            text = str(q_data.text).strip()
             if not text or text in seen_texts:
                 continue
             seen_texts.add(text)
             items.append(QuestionItem(
                 id=make_question_id(node_path, len(items) + 1),
                 text=text,
-                bloom_level=self._normalize_bloom(q_data.get("bloom_level", "")),
+                bloom_level=self._normalize_bloom(q_data.bloom_level),
                 node_path=node_path,
             ))
         if not items:

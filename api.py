@@ -3,8 +3,11 @@ import json
 import logging
 from typing import Optional
 from typing import Any
+from typing import Generic
+from typing import TypeVar
 
 import httpx
+from pydantic import BaseModel, ValidationError
 from tenacity import (
     before_sleep_log,
     retry,
@@ -15,12 +18,18 @@ from tenacity import (
 
 logger = logging.getLogger(__name__)
 
+StructuredModelT = TypeVar("StructuredModelT", bound=BaseModel)
+
 
 class LLMResponseError(Exception):
     pass
 
 
 class MissingToolCallError(LLMResponseError):
+    pass
+
+
+class StructuredOutputValidationError(LLMResponseError):
     pass
 
 
@@ -51,6 +60,14 @@ class ChatToolCallResult:
     content: str = ""
 
 
+@dataclass(frozen=True)
+class ChatStructuredResult(Generic[StructuredModelT]):
+    tool_name: str
+    payload: StructuredModelT
+    reasoning_content: str = ""
+    content: str = ""
+
+
 class LLMClient:
     def __init__(self, base_url: str, api_key: str, model: str, timeout: int = 120):
         self.base_url = base_url.rstrip("/")
@@ -77,6 +94,9 @@ class LLMClient:
         temperature: float = 0.3,
         max_tokens: Optional[int] = None,
     ) -> dict:
+        # Legacy structured-output path. New code in this synthetic-data repo
+        # should prefer chat_structured/chat_structured_result so the final
+        # contract is carried by tool-call arguments rather than assistant prose.
         return self.chat_json_result(
             messages,
             temperature=temperature,
@@ -97,6 +117,62 @@ class LLMClient:
     ) -> ChatJSONResult:
         raw = self._post(self._build_chat_body(messages, temperature, max_tokens))
         return self._parse_chat_json_result(raw)
+
+    def chat_structured(
+        self,
+        messages: list[dict],
+        *,
+        output_model: type[StructuredModelT],
+        tool_name: str,
+        tool_description: str,
+        tool_choice: Any = None,
+        temperature: float = 0.0,
+        max_tokens: Optional[int] = None,
+    ) -> StructuredModelT:
+        # Main structured-output entrypoint: callers provide the semantic model
+        # they want back, and the API layer handles the provider-specific
+        # function-tool envelope.
+        return self.chat_structured_result(
+            messages,
+            output_model=output_model,
+            tool_name=tool_name,
+            tool_description=tool_description,
+            tool_choice=tool_choice,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        ).payload
+
+    def chat_structured_result(
+        self,
+        messages: list[dict],
+        *,
+        output_model: type[StructuredModelT],
+        tool_name: str,
+        tool_description: str,
+        tool_choice: Any = None,
+        temperature: float = 0.0,
+        max_tokens: Optional[int] = None,
+    ) -> ChatStructuredResult[StructuredModelT]:
+        raw = self.chat_tool_call_result(
+            self._with_structured_output_guidance(messages, tool_name=tool_name),
+            tool=self._build_pydantic_tool(output_model, name=tool_name, description=tool_description),
+            tool_choice=tool_choice,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        try:
+            payload = output_model.model_validate(raw.arguments)
+        except ValidationError as exc:
+            raise StructuredOutputValidationError(
+                "Invalid structured tool arguments for "
+                f"{tool_name!r}: {exc}; arguments_preview={str(raw.arguments)[:500]}"
+            ) from exc
+        return ChatStructuredResult(
+            tool_name=raw.tool_name,
+            payload=payload,
+            reasoning_content=raw.reasoning_content,
+            content=raw.content,
+        )
 
     @retry(
         stop=stop_after_attempt(5),
@@ -156,6 +232,48 @@ class LLMClient:
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
         return body
+
+    @staticmethod
+    def _with_structured_output_guidance(
+        messages: list[dict],
+        *,
+        tool_name: str,
+    ) -> list[dict]:
+        # Keep this guidance centralized so provider/protocol knowledge lives in
+        # one place instead of being re-explained in every business prompt.
+        guidance = {
+            "role": "system",
+            "content": (
+                "Return the final structured result by calling the provided function "
+                f"`{tool_name}` exactly once. Do not place the final structured payload "
+                "in assistant text."
+            ),
+        }
+        insert_at = 0
+        for message in messages:
+            if message.get("role") == "system":
+                insert_at += 1
+                continue
+            break
+        return [*messages[:insert_at], guidance, *messages[insert_at:]]
+
+    @staticmethod
+    def _build_pydantic_tool(
+        output_model: type[BaseModel],
+        *,
+        name: str,
+        description: str,
+    ) -> dict[str, Any]:
+        # Tool parameter schema is derived from the typed output model so the
+        # wire contract and runtime validation stay aligned.
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": output_model.model_json_schema(),
+            },
+        }
 
     def _post(self, body: dict) -> dict:
         resp = self._client.post(

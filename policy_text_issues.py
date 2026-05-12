@@ -9,6 +9,7 @@ from typing import Literal
 PolicyTextIssueCode = Literal[
     "belief_empty",
     "thinking_empty",
+    "belief_decision_leak",
     "missing_counterparty_name",
     "belief_too_long",
     "thinking_too_long",

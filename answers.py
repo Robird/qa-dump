@@ -57,6 +57,10 @@ class AnswerGenerator:
                 {"role": "user", "content": self.p["answer_user"].format(question=question.text)},
             ]
             try:
+                # Long-form answers are the last remaining legacy structured path.
+                # We are standardizing new structured outputs on tool calls, but
+                # this call stays on chat_json_result until we finish a more
+                # targeted migration for long answer payloads and reasoning capture.
                 response = self.llm.chat_json_result(messages)
                 answer_text = str(response.data.get("answer", "")).strip()
                 if not answer_text:

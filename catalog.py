@@ -4,6 +4,7 @@ from typing import Optional
 
 from api import LLMClient
 from models import (
+    CategoryListResponse,
     Checkpoint,
     KnowledgeNode,
     KnowledgeTree,
@@ -79,7 +80,13 @@ class CatalogBuilder:
             {"role": "system", "content": self.p["root_system"]},
             {"role": "user", "content": self.p["root_user"].format(domain=domain)},
         ]
-        result = self.llm.chat_json(messages)
+        result = self.llm.chat_structured(
+            messages,
+            output_model=CategoryListResponse,
+            tool_name="submit_root_categories",
+            tool_description="Submit the root-level domain categories for the requested knowledge tree.",
+            temperature=0.3,
+        )
         children = self._parse_categories(result)
         for child in children:
             child.depth = 1
@@ -98,19 +105,24 @@ class CatalogBuilder:
                 name=node.name, description=node.description
             )},
         ]
-        result = self.llm.chat_json(messages)
+        result = self.llm.chat_structured(
+            messages,
+            output_model=CategoryListResponse,
+            tool_name="submit_child_categories",
+            tool_description="Submit the child categories for the requested knowledge topic.",
+            temperature=0.3,
+        )
         return self._parse_categories(result)
 
     @staticmethod
-    def _parse_categories(result: dict) -> list[KnowledgeNode]:
-        raw = result.get("categories", [])
+    def _parse_categories(result: CategoryListResponse) -> list[KnowledgeNode]:
         nodes = []
-        for item in raw:
-            slug = item.get("slug", "") or to_slug(item.get("name", "untitled"))
+        for item in result.categories:
+            slug = item.slug or to_slug(item.name or "untitled")
             nodes.append(KnowledgeNode(
-                name=item.get("name", "Untitled"),
+                name=item.name or "Untitled",
                 slug=slug,
-                description=item.get("description", ""),
+                description=item.description,
             ))
         return nodes
 
