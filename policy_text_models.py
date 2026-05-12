@@ -6,6 +6,12 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from entity_catalog import (
+    CounterpartyMention,
+    counterparty_mention_for,
+    first_mention_name_for,
+    make_counterparty_entity_id,
+)
 from policy_models import PolicyRecord
 from policy_text_contracts import (
     LanguageCode,
@@ -16,7 +22,7 @@ from policy_text_contracts import (
 from relation_catalog import canonical_relation_kind
 
 
-TEXT_SCHEMA_VERSION = "1.1"
+TEXT_SCHEMA_VERSION = "1.2"
 
 
 @dataclass(frozen=True)
@@ -33,14 +39,14 @@ class IntentSpec:
 
 
 IMMEDIATE_HELP_CUES_ZH: tuple[str, ...] = (
-    "现在就帮",
-    "马上帮",
-    "立刻帮",
-    "这就帮",
-    "我来帮",
-    "我先帮",
-    "我现在处理",
-    "直接帮你",
+    "现在接下",
+    "马上处理",
+    "立刻处理",
+    "现在处理",
+    "我先接下",
+    "我来处理",
+    "这就处理",
+    "直接接下",
 )
 
 DEFER_CUES_ZH: tuple[str, ...] = (
@@ -55,14 +61,14 @@ DEFER_CUES_ZH: tuple[str, ...] = (
 )
 
 IMMEDIATE_HELP_CUES_EN: tuple[str, ...] = (
-    "help right now",
-    "help now",
-    "do it now",
-    "take care of it now",
-    "handle it now",
-    "let me help",
-    "i'll help now",
-    "i can do it now",
+    "take this on now",
+    "handle this now",
+    "work on this now",
+    "deal with this now",
+    "pick this up now",
+    "start on this now",
+    "do this now",
+    "step in now",
 )
 
 DEFER_CUES_EN: tuple[str, ...] = (
@@ -127,7 +133,7 @@ INTENT_SPECS: dict[PolicyDecisionName, IntentSpec] = {
         prompt_description_en="Only acknowledge receipt briefly without promising later help.",
         must_have_any_zh=("收到", "知道了", "先回应", "简单回应", "应一声", "表示收到"),
         must_not_have_any_zh=DEFER_CUES_ZH + IMMEDIATE_HELP_CUES_ZH,
-        must_have_any_en=("got it", "noted", "i saw this", "i hear you", "message received"),
+        must_have_any_en=("got it", "noted", "i saw this", "message received", "acknowledged"),
         must_not_have_any_en=DEFER_CUES_EN + IMMEDIATE_HELP_CUES_EN,
     ),
     "set_boundary": IntentSpec(
@@ -149,7 +155,7 @@ INTENT_SPECS: dict[PolicyDecisionName, IntentSpec] = {
         prompt_description_en="Redirect the person to another time or communication channel.",
         must_have_any_zh=("换个时间", "之后再聊", "发到", "邮件", "群里", "明天再", "回头再"),
         must_not_have_any_zh=IMMEDIATE_HELP_CUES_ZH,
-        must_have_any_en=("another time", "email me", "put it in the group", "message me later", "tomorrow"),
+        must_have_any_en=("another time", "email channel", "group channel", "move this to email", "tomorrow"),
         must_not_have_any_en=IMMEDIATE_HELP_CUES_EN,
     ),
 }
@@ -206,6 +212,7 @@ class PolicyTextDecisionInput(BaseModel):
 
 
 class PolicyTextRealizationInput(BaseModel):
+    counterparty_mention: CounterpartyMention
     relation: PolicyTextRelationInput = Field(default_factory=PolicyTextRelationInput)
     state: PolicyTextStateInput = Field(default_factory=PolicyTextStateInput)
     request_context: PolicyTextRequestContextInput = Field(default_factory=PolicyTextRequestContextInput)
@@ -235,6 +242,9 @@ class PolicyTextRecordBase(BaseModel):
     language: LanguageCode
     source_policy_record_id: str
     relation_kind: RelationKind
+    counterparty_entity_id: str
+    counterparty_canonical_name: str
+    counterparty_first_mention_name: str
     will_help_now: bool
     policy_decision: PolicyDecisionName
     response_intent: ResponseIntent
@@ -254,6 +264,9 @@ class PolicyTextArtifactRecord(PolicyTextRecordBase):
                 "language",
                 "source_policy_record_id",
                 "relation_kind",
+                "counterparty_entity_id",
+                "counterparty_canonical_name",
+                "counterparty_first_mention_name",
                 "will_help_now",
                 "policy_decision",
                 "response_intent",
@@ -281,6 +294,9 @@ class PolicyTextExportRecord(PolicyTextRecordBase):
                 "language",
                 "source_policy_record_id",
                 "relation_kind",
+                "counterparty_entity_id",
+                "counterparty_canonical_name",
+                "counterparty_first_mention_name",
                 "will_help_now",
                 "policy_decision",
                 "response_intent",
@@ -329,6 +345,15 @@ def validate_policy_text_artifact(
     if artifact.relation_kind != expected_relation_kind:
         raise ValueError("artifact relation_kind does not match embedded source_policy relation label")
 
+    expected_mention = counterparty_mention_for(artifact.source_policy.counterparty, expected_relation_kind)
+    actual_counterparty_fields = {
+        "entity_id": artifact.counterparty_entity_id,
+        "canonical_name": artifact.counterparty_canonical_name,
+        "first_mention_name": artifact.counterparty_first_mention_name,
+    }
+    if actual_counterparty_fields != expected_mention.model_dump():
+        raise ValueError("artifact counterparty fields do not match embedded source_policy counterparty mention")
+
     if not artifact.belief.strip():
         raise ValueError("artifact belief is empty")
     if not artifact.thinking.strip():
@@ -354,6 +379,9 @@ def project_policy_text_export(artifact: PolicyTextArtifactRecord) -> PolicyText
                 "language",
                 "source_policy_record_id",
                 "relation_kind",
+                "counterparty_entity_id",
+                "counterparty_canonical_name",
+                "counterparty_first_mention_name",
                 "will_help_now",
                 "policy_decision",
                 "response_intent",
@@ -377,6 +405,26 @@ def _validate_policy_text_record_base(
         raise ValueError(f"{contract_name} record_id is empty")
     if not record.source_policy_record_id:
         raise ValueError(f"{contract_name} source_policy_record_id is empty")
+    for field_name in (
+        "counterparty_entity_id",
+        "counterparty_canonical_name",
+        "counterparty_first_mention_name",
+    ):
+        if not getattr(record, field_name).strip():
+            raise ValueError(f"{contract_name} {field_name} is empty")
+    expected_entity_id = make_counterparty_entity_id(record.source_policy_record_id)
+    if record.counterparty_entity_id != expected_entity_id:
+        raise ValueError(
+            f"{contract_name} counterparty_entity_id does not match deterministic source policy entity id"
+        )
+    expected_first_mention = first_mention_name_for(
+        record.relation_kind,
+        record.counterparty_canonical_name,
+    )
+    if record.counterparty_first_mention_name != expected_first_mention:
+        raise ValueError(
+            f"{contract_name} counterparty_first_mention_name does not match controlled mention template"
+        )
     if not record.belief.strip():
         raise ValueError(f"{contract_name} belief is empty")
     if not record.thinking.strip():

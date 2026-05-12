@@ -14,9 +14,10 @@ from api import LLMClient
 from derived_lifecycle import DerivedTaskResult, run_derived_task
 from derived_specs import POLICY_RECORDS_SPEC, POLICY_TEXT_RECORDS_SPEC
 from derived_storage import DerivedRunState, DerivedStorageManager
+from entity_catalog import counterparty_mention_for
 from fs_utils import write_jsonl
 from policy_generator import DEFAULT_PROFILE, PolicyGenerator
-from policy_models import PolicyRecord, make_policy_record_id
+from policy_models import POLICY_GENERATOR_VERSION, PolicyRecord, make_policy_record_id, validate_policy_record
 from policy_text_generator import PolicyTextGenerator, select_text_profile
 from policy_text_models import (
     PolicyTextArtifactRecord,
@@ -38,6 +39,31 @@ from task_contracts import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _load_validated_policy_records(storage: DerivedStorageManager) -> list[PolicyRecord]:
+    records: list[PolicyRecord] = []
+    errors: list[str] = []
+    for item_key in storage.list_existing_keys():
+        raw = storage.read_item(item_key)
+        if raw is None:
+            errors.append(f"{item_key}: missing policy record payload")
+            continue
+        try:
+            records.append(validate_policy_record(raw, expected_record_id=item_key))
+        except Exception as exc:
+            errors.append(f"{item_key}: {exc}")
+    if errors:
+        preview = "; ".join(errors[:3])
+        extra = "" if len(errors) <= 3 else f" (+{len(errors) - 3} more)"
+        raise ValueError(f"Policy-record artifact contract violations: {preview}{extra}")
+    return records
+
+
+def _rebuild_policy_records_export_view(storage: DerivedStorageManager) -> int:
+    export_records = [record.model_dump() for record in _load_validated_policy_records(storage)]
+    write_jsonl(storage.export_path(), export_records)
+    return len(export_records)
 
 
 def _load_validated_policy_text_artifacts(storage: DerivedStorageManager) -> list[PolicyTextArtifactRecord]:
@@ -138,6 +164,7 @@ def _write_policy_records(
 ) -> int:
     written = 0
     for record in records:
+        record = validate_policy_record(record, expected_record_id=record.record_id)
         if record.record_id in existing_keys:
             continue
         if not record.created_at:
@@ -313,7 +340,7 @@ def run_generate_policy_records(args: argparse.Namespace) -> None:
 
         all_keys = storage.list_existing_keys()
         export_path = storage.export_path()
-        export_lines = storage.rebuild_export_view()
+        export_lines = _rebuild_policy_records_export_view(storage)
         finished_at = utc_now_iso()
         result_holder.update({
             "all_keys": all_keys,
@@ -329,7 +356,7 @@ def run_generate_policy_records(args: argparse.Namespace) -> None:
                 "export_lines": export_lines,
                 "seed": args.seed,
                 "sampler_profile": DEFAULT_PROFILE.name,
-                "generator_version": "1.0",
+                "generator_version": POLICY_GENERATOR_VERSION,
                 "generated_at": finished_at,
             },
             run_state=DerivedRunState(
@@ -504,13 +531,14 @@ def run_generate_policy_text_records(args: argparse.Namespace) -> None:
                     raw = policy_storage.read_item(source_key)
                     if raw is None:
                         raise FileNotFoundError(f"Missing source policy record: {source_key}")
-                    source_policy = PolicyRecord(**raw)
+                    source_policy = validate_policy_record(raw, expected_record_id=source_key)
                     if source_policy.record_id != source_key:
                         raise ValueError(
                             f"Source policy record_id {source_policy.record_id!r} does not match item key {source_key!r}"
                         )
                     intent_spec = intent_spec_from_decision(source_policy.policy.decision)
                     relation_kind = canonical_relation_kind(source_policy.relation.relation_label)
+                    counterparty_mention = counterparty_mention_for(source_policy.counterparty, relation_kind)
                     text_profile = select_text_profile(source_policy.record_id, args.seed)
                     last_error: Exception | None = None
                     realization = None
@@ -569,6 +597,9 @@ def run_generate_policy_text_records(args: argparse.Namespace) -> None:
                             language=args.language,
                             source_policy_record_id=source_policy.record_id,
                             relation_kind=relation_kind,
+                            counterparty_entity_id=counterparty_mention.entity_id,
+                            counterparty_canonical_name=counterparty_mention.canonical_name,
+                            counterparty_first_mention_name=counterparty_mention.first_mention_name,
                             will_help_now=intent_spec.will_help_now,
                             policy_decision=source_policy.policy.decision,
                             response_intent=intent_spec.response_intent,

@@ -89,11 +89,17 @@ Implementation note for the first clean release:
 ### Non-goals for v1
 
 - tool-call training
-- `action` node generation
 - multi-turn ACML threads
 - name/persona synthesis
 - indirect relation reasoning from names or pronouns
 - separate loss-policy markup
+
+Clarification:
+
+- v1 may still use `<acml:action>` as mixed content inside the `me` entry for
+  outward reply-bearing branches
+- the non-goal is a separate top-level `action` entry or a task-specific
+  action DSL beyond basic reply projection
 
 Important input-contract rule:
 
@@ -251,7 +257,9 @@ Rules:
 
 Recommended v1 behavior:
 
-- use `policy_text_record.belief` as-is
+- use `policy_text_record.belief` as the natural-language core
+- prepend a compact runtime affordance prelude when the task wants to expose
+  available outward actions explicitly
 - do not add QA answer text here
 - do not restate the entire structured policy snapshot
 
@@ -259,7 +267,30 @@ Reason:
 
 - `policy_text_records` already exists to express relation/state context in a
   compact natural form
-- re-realizing belief during composition would create unnecessary instability
+- a short runtime affordance declaration can live alongside belief without
+  forcing the LLM to infer an action API from thin air
+- re-realizing the belief prose itself during composition would create
+  unnecessary instability
+
+Recommended minimal runtime affordance style:
+
+```text
+我当前可调用的外部动作原型：
+void SendMessage(string target_entity_id, string message);
+```
+
+Recommended v1 variation rule:
+
+- sample one reply-tool name from a small curated inventory per sample
+- sample one runtime affordance prelude from a small curated inventory per
+  sample
+- keep that choice deterministic from `sample_id` for reproducibility
+- derive the reply-tool name and the prelude variant independently so local
+  diversity grows without breaking sample-internal consistency
+- the same sampled name must appear consistently in both the belief prototype
+  and the `me` action call
+- keep the prototype signature itself stable across variants; only vary the
+  surrounding natural-language lead-in lightly
 
 
 ## 8. Me Projection
@@ -273,24 +304,37 @@ Reason:
 Implementation note:
 
 - `me` surface composition should be table-driven by `response_intent`
-- the v1 table may still collapse most intents to the same text-only shape
-- `help_now` remains the only rule that appends QA answer content in MVP
+- non-help branches may remain text-only in v1
+- `help_now` should attach the outward reply as `<acml:action>` mixed content
+  rather than inlining the QA answer into internal monologue text
 
 ### When `will_help_now == true`
 
 `me` should contain:
 
 - `policy_text_records.thinking`
-- the QA source answer content
+- one reply-bearing `<acml:action>` whose content is a minimal tool-style
+  invocation and whose payload preserves the QA source answer content
 
-The answer content should be treated as part of the ongoing internal reasoning
-stream, not as a separate assistant-response wrapper.
+This keeps internal reasoning and outward interaction separated while still
+preserving the QA answer as the knowledge authority.
 
 Important rule:
 
 - preserve QA answer truth as the knowledge authority
-- allow light stylistic joining if needed
+- keep the answer content inside the action payload rather than rewriting it
+  into the `thinking` text
+- use one fake-but-explicit reply tool name sampled from a small inventory
+  such as `SendMessage`, `SendMsg`, `send_message`, `Speek`, or `speek`
 - do not fabricate a substantively different answer
+
+Recommended v1 action style:
+
+```text
+<acml:action tool="SendMessage" dialect="csharp-v0" target_entity_id="person__sample__...">
+SendMessage(target_entity_id: "person__sample__...", message: <acml:payload>...</acml:payload>)
+</acml:action>
+```
 
 ### When `will_help_now == false`
 
@@ -385,8 +429,14 @@ Recommended entry attributes:
 Not included in v1:
 
 - `loss`
-- `action`
 - document-level lineage references inside ACML
+
+Included in v1:
+
+- optional `<acml:action>` mixed content inside the `me` entry for
+  reply-bearing branches
+- lightweight action attrs such as `tool`, `dialect`, and `target_entity_id`
+  when the projection task wants to teach a concrete reply primitive
 
 Important future-compatibility rule:
 
@@ -445,11 +495,20 @@ Minimum validation should check:
 - `observation` contains exactly one payload node with the original question text
 - `belief` is non-empty
 - `me` is non-empty
-- `will_help_now == false` implies `me` does not contain the source QA answer
+- `will_help_now == false` implies `me` contains no reply action carrying the
+  source QA answer
 
 Recommended extra validation:
 
-- `will_help_now == true` implies `me` contains at least part of the source QA answer
+- `belief` begins with the configured runtime affordance prelude when reply
+  tools are enabled for the task
+- the sampled runtime affordance prelude variant is deterministic from
+  `sample_id`
+- the sampled reply-tool name matches between belief prototype and `me` action
+- `will_help_now == true` implies `me` contains exactly one reply action whose
+  payload equals the source QA answer
+- `will_help_now == true` implies `thinking` text itself does not inline the
+  source QA answer
 - non-help branches do not leak long answer-like spans
 - ACML attributes do not contain forbidden characters
 

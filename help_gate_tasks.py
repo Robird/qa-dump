@@ -43,6 +43,13 @@ class HelpGateACMLItem(BaseModel):
     relation_kind: RelationKind
     will_help_now: bool
     response_intent: ResponseIntent
+    composition_version: str
+    source_counterparty_entity_id: str
+    sample_counterparty_entity_id: str
+    counterparty_canonical_name: str
+    counterparty_first_mention_name: str
+    reply_tool_name: str
+    belief_runtime_affordance_variant_id: str
     policy_decision: PolicyDecisionName
     domain_slug: str
     bloom_level: str
@@ -157,6 +164,7 @@ def _help_gate_config_doc(
 ) -> dict:
     return {
         "task": "help_gate_acml",
+        "composition_version": HELP_GATE_ACML_COMPOSITION_VERSION,
         **request.config_fields(),
     }
 
@@ -172,6 +180,10 @@ def _validate_help_gate_acml_resume_config(run_dir: Path, *, request: HelpGateSo
         )
         sys.exit(1)
     expected = request.config_fields()
+    expected = {
+        "composition_version": HELP_GATE_ACML_COMPOSITION_VERSION,
+        **expected,
+    }
     mismatches = [
         f"{key}={existing_config.get(key)!r} (requested {value!r})"
         for key, value in expected.items()
@@ -224,6 +236,7 @@ def _build_help_gate_preflight_report(
             "sample": [record.model_dump() for record in plan.sample_policy_text_records()],
         },
         "composition": {
+            "composition_version": HELP_GATE_ACML_COMPOSITION_VERSION,
             "pairing_strategy": plan.pairing_strategy,
             "estimated_samples": plan.estimated_samples,
             "generation_readiness": plan.generation_readiness,
@@ -310,6 +323,13 @@ def _generate_samples(
                 domain_slug=pairing.payload.domain_slug,
                 bloom_level=pairing.payload.bloom_level,
                 created_at=utc_now_iso(),
+                composition_version=HELP_GATE_ACML_COMPOSITION_VERSION,
+                source_counterparty_entity_id=composition.source_counterparty_entity_id,
+                sample_counterparty_entity_id=composition.sample_counterparty_entity_id,
+                counterparty_canonical_name=composition.counterparty_canonical_name,
+                counterparty_first_mention_name=composition.counterparty_first_mention_name,
+                reply_tool_name=composition.reply_tool_name,
+                belief_runtime_affordance_variant_id=composition.belief_runtime_affordance_variant_id,
             )
             storage.write_item(sample_id, item.model_dump())
             completed_keys.add(sample_id)
@@ -355,6 +375,7 @@ def _summary_fields_for_preflight(
         "generated": generated,
         "skipped_existing": skipped_existing,
         "failed_items": 0,
+        "composition_version": HELP_GATE_ACML_COMPOSITION_VERSION,
         "generated_at": generated_at,
         **_help_gate_summary_source_fields(plan),
     }
@@ -369,6 +390,10 @@ def _summary_fields_for_generation(
     will_help_counter = Counter("true" if item.will_help_now else "false" for item in generation.all_items)
     response_counter = Counter(item.response_intent for item in generation.all_items)
     domain_counter = Counter(item.domain_slug for item in generation.all_items)
+    reply_tool_counter = Counter(item.reply_tool_name for item in generation.all_items)
+    belief_affordance_counter = Counter(
+        item.belief_runtime_affordance_variant_id for item in generation.all_items
+    )
     return {
         "phase": "acml_generation",
         "payload_count": plan.payload_count,
@@ -387,6 +412,8 @@ def _summary_fields_for_generation(
         "will_help_now_distribution": dict(will_help_counter),
         "response_intent_distribution": dict(response_counter),
         "domain_distribution": dict(domain_counter),
+        "reply_tool_name_distribution": dict(reply_tool_counter),
+        "belief_runtime_affordance_distribution": dict(belief_affordance_counter),
         "generated_at": generated_at,
         **_help_gate_summary_source_fields(plan),
     }
@@ -537,6 +564,7 @@ def run_help_gate_acml(args: argparse.Namespace) -> dict[str, object]:
                 "phase": "acml_generation",
                 "qa_run_id": request.qa_run_id,
                 "policy_text_run_id": request.policy_text_run_id,
+                "composition_version": HELP_GATE_ACML_COMPOSITION_VERSION,
                 "requested": plan.estimated_samples,
                 "generated": len(all_items),
                 "failed_items": failure_events if failure_events else 1,

@@ -225,3 +225,28 @@ def canonical_relation_kind(label: str) -> RelationKind:
 
 def observation_wrapper_for(language: LanguageCode, relation_kind: RelationKind) -> str:
     return OBSERVATION_WRAPPERS[language][relation_kind]
+
+
+def named_observation_wrapper_for(
+    language: LanguageCode,
+    relation_kind: RelationKind,
+    first_mention_name: str,
+) -> str:
+    first_mention_name = first_mention_name.strip()
+    if not first_mention_name:
+        raise ValueError("first_mention_name must be non-empty")
+    wrapper = observation_wrapper_for(language, relation_kind)
+    if language == "zh":
+        if wrapper.endswith("问我："):
+            return f"{first_mention_name}问我："
+        if wrapper.endswith("对我说："):
+            return f"{first_mention_name}对我说："
+    elif language == "en":
+        if wrapper.endswith(" asks me: "):
+            return f"{first_mention_name} asks me: "
+        if wrapper.endswith(" says to me: "):
+            return f"{first_mention_name} says to me: "
+    raise ValueError(
+        "unsupported named observation wrapper projection "
+        f"for language={language!r}, relation_kind={relation_kind!r}"
+    )

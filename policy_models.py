@@ -7,9 +7,14 @@ QA, help, trust, compliance, and other future payload families.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
+from entity_catalog import CounterpartyIdentity, make_counterparty_identity, validate_counterparty_identity
 from relation_catalog import POLICY_RELATION_PROFILES
+
+
+POLICY_SCHEMA_VERSION = "1.1"
+POLICY_GENERATOR_VERSION = "1.1"
 
 
 # ---------------------------------------------------------------------------
@@ -109,13 +114,16 @@ class PolicyDecision(BaseModel):
 
 class PolicyRecord(BaseModel):
     # Provenance
-    schema_version: str = "1.0"
-    generator_version: str = "1.0"
+    schema_version: str = POLICY_SCHEMA_VERSION
+    generator_version: str = POLICY_GENERATOR_VERSION
     record_id: str = ""
     task_family: str = "policy_layer_foundation"
     seed: int = 0
     sampler_profile: str = ""
     created_at: str = ""
+
+    # Record-local entity anchor
+    counterparty: CounterpartyIdentity
 
     # Scope contract
     request_contract: RequestContract = Field(default_factory=RequestContract)
@@ -126,10 +134,27 @@ class PolicyRecord(BaseModel):
     cost_risk: CostRiskSlice = Field(default_factory=CostRiskSlice)
     policy: PolicyDecision = Field(default_factory=PolicyDecision)
 
+    @model_validator(mode="after")
+    def _validate_policy_record_contract(self) -> "PolicyRecord":
+        if self.schema_version != POLICY_SCHEMA_VERSION:
+            raise ValueError(
+                f"policy schema_version {self.schema_version!r} does not match expected {POLICY_SCHEMA_VERSION!r}"
+            )
+        if self.generator_version != POLICY_GENERATOR_VERSION:
+            raise ValueError(
+                "policy generator_version "
+                f"{self.generator_version!r} does not match expected {POLICY_GENERATOR_VERSION!r}"
+            )
+        if not self.record_id:
+            raise ValueError("policy record_id is required")
+        validate_counterparty_identity(self.counterparty, expected_record_id=self.record_id)
+        return self
+
     def stamp(self, record_id: str, seed: int, profile: str) -> None:
         self.record_id = record_id
         self.seed = seed
         self.sampler_profile = profile
+        self.counterparty = make_counterparty_identity(record_id)
 
 
 # ---------------------------------------------------------------------------
@@ -176,3 +201,18 @@ RELATION_PROFILES: list[dict] = [profile.copy() for profile in POLICY_RELATION_P
 
 def make_policy_record_id(index: int) -> str:
     return f"policy_rec__{index:06d}"
+
+
+def validate_policy_record(
+    raw: dict | PolicyRecord,
+    *,
+    expected_record_id: str | None = None,
+) -> PolicyRecord:
+    record = PolicyRecord.model_validate(
+        raw.model_dump() if isinstance(raw, PolicyRecord) else raw
+    )
+    if expected_record_id is not None and record.record_id != expected_record_id:
+        raise ValueError(
+            f"policy record_id {record.record_id!r} does not match item key {expected_record_id!r}"
+        )
+    return record

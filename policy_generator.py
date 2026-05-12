@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+from entity_catalog import make_counterparty_identity
 from policy_models import (
     DECISION_STRATEGY_MAP,
     DECISION_VALUES,
@@ -439,6 +440,7 @@ class PolicyGenerator:
         while accepted_count < count and attempts < max_attempts:
             attempts += 1
             index = accepted_count
+            record_id = make_policy_record_id(index + 1)
 
             # Stage 1: pick decision (quota-aware)
             decision = _sample_decision(self.rng, decision_quotas)
@@ -464,6 +466,10 @@ class PolicyGenerator:
 
             # Assemble
             record = PolicyRecord(
+                record_id=record_id,
+                seed=self.seed,
+                sampler_profile=self.profile.name,
+                counterparty=make_counterparty_identity(record_id),
                 request_contract=RequestContract(),
                 relation=relation,
                 state=state,
@@ -489,7 +495,7 @@ class PolicyGenerator:
 
             # Stamp provenance
             record.stamp(
-                record_id=make_policy_record_id(index + 1),
+                record_id=record_id,
                 seed=self.seed,
                 profile=self.profile.name,
             )
