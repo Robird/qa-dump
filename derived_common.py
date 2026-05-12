@@ -7,6 +7,8 @@ import argparse
 import logging
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -299,12 +301,160 @@ def build_policy_text_records_parser() -> argparse.ArgumentParser:
         help="Resume by skipping already-completed items",
     )
     parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=1,
+        help="Maximum concurrent LLM workers for text realization",
+    )
+    parser.add_argument(
         "--verbose",
         "-v",
         action="store_true",
         help="Verbose logging",
     )
     return parser
+
+
+def _realize_one_policy_text(
+    source_key: str,
+    *,
+    policy_storage: DerivedStorageManager,
+    storage: DerivedStorageManager,
+    base_url: str,
+    api_key: str,
+    language: str,
+    runtime_config: PolicyTextRuntimeConfig,
+    max_attempts: int,
+    run_id: str,
+    failure_lock: threading.Lock,
+) -> dict:
+    """Process a single policy text realization in a worker thread.
+
+    Each worker creates its own LLM runtime so that the underlying httpx.Client
+    is never shared across threads.
+    """
+    item_key = make_policy_text_record_id(source_key)
+    raw = policy_storage.read_item(source_key)
+    if raw is None:
+        error_msg = f"Missing source policy record: {source_key}"
+        with failure_lock:
+            storage.append_failure(
+                {
+                    "task_name": POLICY_TEXT_RECORDS_SPEC.task_name,
+                    "run_id": run_id,
+                    "source_policy_record_id": source_key,
+                    "item_key": item_key,
+                    "failed_at": utc_now_iso(),
+                    "error_type": "FileNotFoundError",
+                    "error": error_msg,
+                }
+            )
+        return {
+            "source_key": source_key,
+            "item_key": item_key,
+            "success": False,
+            "judge_rejections": 0,
+            "error": error_msg,
+        }
+
+    source_policy = validate_policy_record(raw, expected_record_id=source_key)
+    if source_policy.record_id != source_key:
+        error_msg = (
+            f"Source policy record_id {source_policy.record_id!r} "
+            f"does not match item key {source_key!r}"
+        )
+        with failure_lock:
+            storage.append_failure(
+                {
+                    "task_name": POLICY_TEXT_RECORDS_SPEC.task_name,
+                    "run_id": run_id,
+                    "source_policy_record_id": source_key,
+                    "item_key": item_key,
+                    "failed_at": utc_now_iso(),
+                    "error_type": "ValueError",
+                    "error": error_msg,
+                }
+            )
+        return {
+            "source_key": source_key,
+            "item_key": item_key,
+            "success": False,
+            "judge_rejections": 0,
+            "error": error_msg,
+        }
+
+    # Each worker owns its own LLM runtime so httpx.Client stays single-thread.
+    with ExitStack() as stack:
+        runtime = build_policy_text_runtime(
+            stack,
+            base_url=base_url,
+            api_key=api_key,
+            language=language,
+            config=runtime_config,
+        )
+        realizer = PolicyTextRealizer(
+            runtime.generator,
+            semantic_judge=runtime.semantic_judge,
+        )
+        task = prepare_policy_text_task(source_policy, language=language)
+        outcome = realizer.realize(task, max_attempts=max_attempts)
+
+    if outcome.last_error is not None:
+        with failure_lock:
+            storage.append_failure(
+                {
+                    "task_name": POLICY_TEXT_RECORDS_SPEC.task_name,
+                    "run_id": run_id,
+                    "source_policy_record_id": source_policy.record_id,
+                    "item_key": item_key,
+                    "failed_at": utc_now_iso(),
+                    "error_type": type(outcome.last_error).__name__,
+                    "error": str(outcome.last_error),
+                }
+            )
+        return {
+            "source_key": source_key,
+            "item_key": item_key,
+            "success": False,
+            "judge_rejections": outcome.judge_rejections,
+            "error": str(outcome.last_error),
+        }
+
+    if outcome.realization is None:
+        error_msg = (
+            f"Policy text realization unexpectedly missing for "
+            f"{source_policy.record_id}"
+        )
+        with failure_lock:
+            storage.append_failure(
+                {
+                    "task_name": POLICY_TEXT_RECORDS_SPEC.task_name,
+                    "run_id": run_id,
+                    "source_policy_record_id": source_policy.record_id,
+                    "item_key": item_key,
+                    "failed_at": utc_now_iso(),
+                    "error_type": "RuntimeError",
+                    "error": error_msg,
+                }
+            )
+        return {
+            "source_key": source_key,
+            "item_key": item_key,
+            "success": False,
+            "judge_rejections": outcome.judge_rejections,
+            "error": error_msg,
+        }
+
+    record = build_policy_text_record(task, outcome.realization)
+    storage.write_item(item_key, record.model_dump())
+    logger.info("Realized %s → %s", source_policy.record_id, item_key)
+    return {
+        "source_key": source_key,
+        "item_key": item_key,
+        "success": True,
+        "judge_rejections": outcome.judge_rejections,
+        "error": None,
+    }
 
 
 def run_generate_policy_records(args: argparse.Namespace) -> None:
@@ -548,66 +698,76 @@ def run_generate_policy_text_records(args: argparse.Namespace) -> None:
             print(f"All {len(requested_item_keys)} requested policy-text records already exist, nothing to do.")
         else:
             base_url, api_key = get_llm_env()
-            with ExitStack() as stack:
-                runtime = build_policy_text_runtime(
-                    stack,
-                    base_url=base_url,
-                    api_key=api_key,
-                    language=args.language,
-                    config=runtime_config,
-                )
+            pending_keys = [k for k in source_keys if make_policy_text_record_id(k) not in existing_keys]
+            total_pending = len(pending_keys)
+            if not pending_keys:
+                print("All requested policy-text records already exist, nothing to do.")
+            else:
+                max_workers = max(1, args.max_workers)
                 logger.info(
-                    "Policy-text generation runtime: generator_model=%s judge_model=%s max_attempts=%s",
+                    "Policy-text generation runtime: generator_model=%s judge_model=%s max_attempts=%s max_workers=%s",
                     runtime_config.model,
                     runtime_config.resolved_judge_model,
                     args.max_attempts,
+                    max_workers,
                 )
-                realizer = PolicyTextRealizer(runtime.generator, semantic_judge=runtime.semantic_judge)
-                for index, source_key in enumerate(source_keys, start=1):
-                    item_key = make_policy_text_record_id(source_key)
-                    if item_key in existing_keys:
-                        continue
-                    raw = policy_storage.read_item(source_key)
-                    if raw is None:
-                        raise FileNotFoundError(f"Missing source policy record: {source_key}")
-                    source_policy = validate_policy_record(raw, expected_record_id=source_key)
-                    if source_policy.record_id != source_key:
-                        raise ValueError(
-                            f"Source policy record_id {source_policy.record_id!r} does not match item key {source_key!r}"
-                        )
-                    logger.info(
-                        "Realizing %s (%d/%d)",
-                        source_policy.record_id,
-                        index,
-                        len(source_keys),
-                    )
-                    task = prepare_policy_text_task(source_policy, language=args.language)
-                    outcome = realizer.realize(
-                        task,
-                        max_attempts=args.max_attempts,
-                    )
-                    judge_rejections += outcome.judge_rejections
-                    if outcome.last_error is not None:
-                        failed_items += 1
-                        storage.append_failure(
-                            {
-                                "task_name": POLICY_TEXT_RECORDS_SPEC.task_name,
-                                "run_id": args.run_id,
-                                "source_policy_record_id": source_policy.record_id,
-                                "item_key": item_key,
-                                "failed_at": utc_now_iso(),
-                                "error_type": type(outcome.last_error).__name__,
-                                "error": str(outcome.last_error),
-                            }
-                        )
-                        continue
-
-                    if outcome.realization is None:
-                        raise RuntimeError(
-                            f"Policy text realization unexpectedly missing for {source_policy.record_id}"
-                        )
-                    record = build_policy_text_record(task, outcome.realization)
-                    storage.write_item(item_key, record.model_dump())
+                print(
+                    f"Realizing {total_pending} policy-text records "
+                    f"with {max_workers} worker(s) ..."
+                )
+                failure_lock = threading.Lock()
+                completed_count = 0
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {
+                        executor.submit(
+                            _realize_one_policy_text,
+                            source_key,
+                            policy_storage=policy_storage,
+                            storage=storage,
+                            base_url=base_url,
+                            api_key=api_key,
+                            language=args.language,
+                            runtime_config=runtime_config,
+                            max_attempts=args.max_attempts,
+                            run_id=args.run_id,
+                            failure_lock=failure_lock,
+                        ): source_key
+                        for source_key in pending_keys
+                    }
+                    for future in as_completed(futures):
+                        source_key = futures[future]
+                        try:
+                            outcome = future.result()
+                        except Exception as exc:
+                            failed_items += 1
+                            item_key = make_policy_text_record_id(source_key)
+                            with failure_lock:
+                                storage.append_failure(
+                                    {
+                                        "task_name": POLICY_TEXT_RECORDS_SPEC.task_name,
+                                        "run_id": args.run_id,
+                                        "source_policy_record_id": source_key,
+                                        "item_key": item_key,
+                                        "failed_at": utc_now_iso(),
+                                        "error_type": type(exc).__name__,
+                                        "error": str(exc),
+                                    }
+                                )
+                            logger.warning(
+                                "Unhandled worker failure for %s: %s",
+                                source_key,
+                                exc,
+                            )
+                        else:
+                            judge_rejections += outcome["judge_rejections"]
+                            if not outcome["success"]:
+                                failed_items += 1
+                            completed_count += 1
+                            if completed_count % 10 == 0 or completed_count == total_pending:
+                                print(
+                                    f"  Progress: {completed_count}/{total_pending} "
+                                    f"({failed_items} failed)"
+                                )
 
         all_keys = storage.list_existing_keys()
         generated_requested = len(requested_item_keys.intersection(all_keys))
