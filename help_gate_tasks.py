@@ -387,6 +387,9 @@ def _summary_fields_for_generation(
     plan: HelpGateSourcePlan,
     generated_at: str,
 ) -> dict:
+    # These counters are intentional observability for synthetic-data diversity.
+    # If a future refactor accidentally collapses a pool, this summary should
+    # make the regression visible instead of silently flattening the dataset.
     will_help_counter = Counter("true" if item.will_help_now else "false" for item in generation.all_items)
     response_counter = Counter(item.response_intent for item in generation.all_items)
     domain_counter = Counter(item.domain_slug for item in generation.all_items)

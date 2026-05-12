@@ -1,4 +1,11 @@
-"""Helpers for composing QA payloads and policy-text records into ACML samples."""
+"""Helpers for composing QA payloads and policy-text records into ACML samples.
+
+This repository produces synthetic training data, so controlled surface
+diversity is a feature rather than noise. Keep augmentation levers like tool
+name pools and runtime-prelude pools unless we have strong evidence that a
+specific variant is harmful. The goal is to widen training coverage while
+preserving the same underlying semantic labels.
+"""
 
 from __future__ import annotations
 
@@ -19,13 +26,17 @@ from acml.semantic_model import (
 from entity_catalog import make_sample_counterparty_entity_id
 from payload_adapter import PayloadRecord
 from policy_text_contracts import LanguageCode
-from policy_text_models import PolicyTextExportRecord
+from policy_text_models import PolicyTextRecord
 from relation_catalog import named_observation_wrapper_for
 
 
 HELP_GATE_ACML_TASK = "help_gate_acml_v1"
-HELP_GATE_ACML_COMPOSITION_VERSION = "1.5"
+HELP_GATE_ACML_COMPOSITION_VERSION = "1.7"
 REPLY_TOOL_DIALECT = "csharp-v0"
+# Training-data augmentation surface: vary lightweight runtime API naming while
+# keeping the signature stable. Downstream validation already guarantees the
+# chosen name stays sample-internal consistent, so do not collapse this pool to
+# a single spelling without an explicit dataset-quality decision.
 REPLY_TOOL_NAME_POOL: tuple[str, ...] = (
     "SendMessage",
     "SendMsg",
@@ -34,6 +45,8 @@ REPLY_TOOL_NAME_POOL: tuple[str, ...] = (
     "speek",
 )
 
+# Another low-risk augmentation surface: keep the actual prototype stable, but
+# diversify the short natural-language lead-in that frames the runtime affordance.
 BELIEF_RUNTIME_AFFORDANCE_PRELUDE_POOL: dict[LanguageCode, tuple[tuple[str, str], ...]] = {
     "zh": (
         ("action_proto_v1", "我当前可调用的外部动作原型："),
@@ -62,7 +75,7 @@ class HelpGateACMLComposition:
     sample_id: str
     language: LanguageCode
     payload: PayloadRecord
-    policy_text: PolicyTextExportRecord
+    policy_text: PolicyTextRecord
     source_counterparty_entity_id: str
     sample_counterparty_entity_id: str
     counterparty_canonical_name: str
@@ -98,11 +111,13 @@ def make_sample_id(
     return f"acml__{digest}"
 
 
-def compose_me_reasoning_text(policy_text: PolicyTextExportRecord) -> str:
+def compose_me_reasoning_text(policy_text: PolicyTextRecord) -> str:
     return policy_text.thinking.strip()
 
 
 def _select_deterministic_pool_item(sample_id: str, *, salt: str, pool: tuple[str, ...]) -> str:
+    # Synthetic diversity should still be reproducible: tie each local wording
+    # choice to sample_id so reruns regenerate the same sample surface.
     raw = f"{sample_id}\x1f{salt}"
     digest = hashlib.sha256(raw.encode("utf-8")).digest()
     return pool[int.from_bytes(digest[:4], "big") % len(pool)]
@@ -143,7 +158,7 @@ def belief_runtime_affordance_variants_for(
 
 def compose_belief_text(
     language: LanguageCode,
-    policy_text: PolicyTextExportRecord,
+    policy_text: PolicyTextRecord,
     *,
     reply_tool_name: str,
     belief_runtime_affordance_variant_id: str,
@@ -159,7 +174,7 @@ def compose_belief_text(
     return f"{prototype}\n\n{belief}"
 
 
-def compose_reply_action_text(payload: PayloadRecord, policy_text: PolicyTextExportRecord) -> str:
+def compose_reply_action_text(payload: PayloadRecord, policy_text: PolicyTextRecord) -> str:
     if not _response_intent_uses_reply_action(policy_text.response_intent):
         return ""
     return payload.fulfillment_content.strip()
@@ -206,7 +221,7 @@ def build_acml_composition(
     sample_id: str,
     language: LanguageCode,
     payload: PayloadRecord,
-    policy_text: PolicyTextExportRecord,
+    policy_text: PolicyTextRecord,
 ) -> HelpGateACMLComposition:
     source_counterparty_entity_id = policy_text.counterparty_entity_id
     sample_counterparty_entity_id = make_sample_counterparty_entity_id(

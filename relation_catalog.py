@@ -232,6 +232,12 @@ def named_observation_wrapper_for(
     relation_kind: RelationKind,
     first_mention_name: str,
 ) -> str:
+    """Project a named observation wrapper without losing the first mention.
+
+    This is another safe synthetic-data augmentation surface: future variants
+    can diversify the wrapper phrasing as long as relation semantics, speech-act
+    direction ("says"/"asks"), and the explicit first mention stay intact.
+    """
     first_mention_name = first_mention_name.strip()
     if not first_mention_name:
         raise ValueError("first_mention_name must be non-empty")

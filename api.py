@@ -20,12 +20,18 @@ class LLMResponseError(Exception):
     pass
 
 
+class MissingToolCallError(LLMResponseError):
+    pass
+
+
 RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 
 def _is_retryable_exception(exc: BaseException) -> bool:
     if isinstance(exc, LLMResponseError):
-        return True
+        # Missing tool calls usually mean the model spent its budget or ignored
+        # the contract, so blind transport-style retries rarely help.
+        return not isinstance(exc, MissingToolCallError)
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in RETRYABLE_STATUS_CODES
     return isinstance(exc, httpx.RequestError)
@@ -35,6 +41,14 @@ def _is_retryable_exception(exc: BaseException) -> bool:
 class ChatJSONResult:
     data: dict[str, Any]
     reasoning_content: str = ""
+
+
+@dataclass(frozen=True)
+class ChatToolCallResult:
+    tool_name: str
+    arguments: dict[str, Any]
+    reasoning_content: str = ""
+    content: str = ""
 
 
 class LLMClient:
@@ -84,6 +98,24 @@ class LLMClient:
         raw = self._post(self._build_chat_body(messages, temperature, max_tokens))
         return self._parse_chat_json_result(raw)
 
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=2, max=60),
+        retry=retry_if_exception(_is_retryable_exception),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+    )
+    def chat_tool_call_result(
+        self,
+        messages: list[dict],
+        *,
+        tool: dict[str, Any],
+        tool_choice: Any = "auto",
+        temperature: float = 0.0,
+        max_tokens: Optional[int] = None,
+    ) -> ChatToolCallResult:
+        raw = self._post(self._build_tool_call_body(messages, tool, tool_choice, temperature, max_tokens))
+        return self._parse_chat_tool_call_result(raw, expected_tool_name=tool["function"]["name"])
+
     def _build_chat_body(
         self,
         messages: list[dict],
@@ -96,6 +128,31 @@ class LLMClient:
             "temperature": temperature,
             "response_format": {"type": "json_object"},
         }
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
+        return body
+
+    def _build_tool_call_body(
+        self,
+        messages: list[dict],
+        tool: dict[str, Any],
+        tool_choice: Any,
+        temperature: float,
+        max_tokens: Optional[int],
+    ) -> dict[str, Any]:
+        body = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "tools": [tool],
+            "parallel_tool_calls": False,
+        }
+        # Some DeepSeek models reject explicit function-style tool_choice even
+        # though they do support tool calls. Callers can pass tool_choice=None
+        # to omit the field entirely and rely on prompt pressure plus the single
+        # supplied tool.
+        if tool_choice is not None:
+            body["tool_choice"] = tool_choice
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
         return body
@@ -115,12 +172,56 @@ class LLMClient:
             reasoning_content=cls._extract_reasoning_content(raw_response),
         )
 
+    @classmethod
+    def _parse_chat_tool_call_result(
+        cls,
+        raw_response: dict,
+        *,
+        expected_tool_name: str,
+    ) -> ChatToolCallResult:
+        message = cls._extract_message(raw_response)
+        tool_calls = message.get("tool_calls") or []
+        reasoning = cls._extract_reasoning_content(raw_response)
+        content = cls._normalize_message_content(message.get("content", ""))
+        if not tool_calls:
+            finish_reason = raw_response.get("choices", [{}])[0].get("finish_reason", "unknown")
+            # Keep both content and reasoning previews in the error: with
+            # reasoning models this is often the fastest way to tell whether we
+            # hit a token budget issue, a contract drift, or a genuine API bug.
+            raise MissingToolCallError(
+                "Missing tool call from model. "
+                f"expected_tool={expected_tool_name!r}, finish_reason={finish_reason!r}, "
+                f"content_preview={content[:200]!r}, reasoning_preview={reasoning[:200]!r}"
+            )
+        for tool_call in tool_calls:
+            function_payload = tool_call.get("function") or {}
+            tool_name = function_payload.get("name")
+            if tool_name != expected_tool_name:
+                continue
+            arguments_text = cls._normalize_message_content(function_payload.get("arguments", ""))
+            arguments = cls._parse_json_object_text(arguments_text)
+            return ChatToolCallResult(
+                tool_name=tool_name,
+                arguments=arguments,
+                reasoning_content=reasoning,
+                content=content,
+            )
+        available_tools = [((tool_call.get("function") or {}).get("name")) for tool_call in tool_calls]
+        raise MissingToolCallError(
+            "Expected tool call not found. "
+            f"expected_tool={expected_tool_name!r}, available_tools={available_tools!r}"
+        )
+
     @staticmethod
-    def _extract_json(raw_response: dict) -> dict:
+    def _extract_message(raw_response: dict) -> dict[str, Any]:
         try:
-            message = raw_response["choices"][0]["message"]
+            return raw_response["choices"][0]["message"]
         except (KeyError, IndexError) as e:
             raise LLMResponseError(f"Unexpected response structure: {e}")
+
+    @staticmethod
+    def _extract_json(raw_response: dict) -> dict:
+        message = LLMClient._extract_message(raw_response)
 
         cleaned = LLMClient._normalize_message_content(message.get("content", ""))
         reasoning = LLMClient._extract_reasoning_content(raw_response).strip()
@@ -128,6 +229,8 @@ class LLMClient:
         if cleaned:
             attempts.append(("content", cleaned))
         if reasoning:
+            # Some reasoning-first APIs occasionally place the usable JSON in
+            # reasoning_content instead of content, so keep this fallback.
             attempts.append(("reasoning_content", reasoning))
 
         if not attempts:
@@ -179,6 +282,9 @@ class LLMClient:
         cleaned = LLMClient._strip_code_fences(content)
         candidates = [cleaned.strip()]
         extracted = LLMClient._extract_first_balanced_json_object(cleaned)
+        # Models sometimes wrap the object with explanatory text. Accept the
+        # first balanced object instead of requiring the whole payload to be
+        # pure JSON.
         if extracted and extracted not in candidates:
             candidates.append(extracted)
         last_error: str | None = None
@@ -229,8 +335,8 @@ class LLMClient:
     @staticmethod
     def _extract_reasoning_content(raw_response: dict) -> str:
         try:
-            message = raw_response["choices"][0]["message"]
-        except (KeyError, IndexError):
+            message = LLMClient._extract_message(raw_response)
+        except LLMResponseError:
             return ""
 
         reasoning = message.get("reasoning_content", "")

@@ -2,59 +2,53 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
+import logging
 import re
 
 from api import LLMClient, LLMResponseError
-from entity_catalog import CounterpartyMention, counterparty_mention_for
-from policy_models import PolicyRecord
+from entity_catalog import CounterpartyMention
+from policy_text_issues import PolicyTextIssue, retry_feedback_needs_name_repetition, summarize_issue_messages
 from policy_text_models import (
-    DEFER_CUES_ZH,
     DEFER_CUES_EN,
-    IMMEDIATE_HELP_CUES_ZH,
+    DEFER_CUES_ZH,
     IMMEDIATE_HELP_CUES_EN,
+    IMMEDIATE_HELP_CUES_ZH,
     IntentSpec,
     PolicyTextRealization,
     PolicyTextRealizationInput,
-    PolicyTextDecisionInput,
-    PolicyTextRelationInput,
-    PolicyTextRequestContextInput,
-    PolicyTextStateInput,
 )
-from relation_catalog import canonical_relation_kind
+from policy_text_preparation import PreparedPolicyTextTask
 
+logger = logging.getLogger(__name__)
 
-STYLE_PROFILES: dict[str, str] = {
-    "warm_brief_v1": "Warm, concise, human, slightly relational.",
-    "neutral_direct_v1": "Neutral, direct, practical, low-drama.",
-    "guarded_soft_v1": "Soft but guarded, slightly defensive, still natural.",
-    "busy_practical_v1": "Busy, time-aware, practical, task-focused.",
-    "candid_close_v1": "Candid and familiar, appropriate for closer relationships.",
-}
+GENERIC_COUNTERPARTY_TERMS_ZH: tuple[str, ...] = (
+    "对方",
+    "这个人",
+    "那个人",
+)
 
-HIGH_SIGNAL_REASON_TAGS: tuple[str, ...] = (
-    "time_pressure_high",
-    "energy_low",
-    "energy_high",
-    "can_do_later",
-    "can_do_now",
-    "trust_constrains_engagement",
-    "trust_enables_engagement",
-    "closeness_enables_engagement",
-    "tension_inhibits_engagement",
-    "regret_high",
-    "socially_guarded",
-    "socially_ready",
-    "clarity_constrains",
-    "clarity_enables",
+GENERIC_COUNTERPARTY_TERMS_EN: tuple[str, ...] = (
+    "the other person",
+    "this person",
+    "that person",
+)
+
+ZH_COUNTERPARTY_PRONOUN_RE = re.compile(r"(?:他们|她们|(?<![其吉])他|她)")
+ZH_COUNTERPARTY_ROMANIZED_PRONOUN_RE = re.compile(r"(?<![A-Za-z])ta(?![A-Za-z])", flags=re.IGNORECASE)
+EN_COUNTERPARTY_PRONOUN_RE = re.compile(
+    r"\b(?:you|your|he|she|him|his|her|hers|himself|herself|they|them|their|theirs|themself|themselves)\b"
 )
 
 
-def select_text_profile(source_policy_record_id: str, seed: int) -> str:
-    names = sorted(STYLE_PROFILES)
-    digest = hashlib.sha256(f"{seed}:{source_policy_record_id}".encode("utf-8")).digest()
-    return names[int.from_bytes(digest[:4], "big") % len(names)]
+class PolicyTextGenerationError(LLMResponseError):
+    pass
+
+
+class PolicyTextRuleValidationError(PolicyTextGenerationError):
+    def __init__(self, issues: list[PolicyTextIssue]):
+        self.issues = tuple(issues)
+        super().__init__("Policy text realization failed rule validation: " + summarize_issue_messages(self.issues))
 
 
 class PolicyTextGenerator:
@@ -73,13 +67,10 @@ class PolicyTextGenerator:
 
     def generate(
         self,
-        policy_record: PolicyRecord,
+        task: PreparedPolicyTextTask,
         *,
-        intent_spec: IntentSpec,
-        text_profile: str,
+        retry_feedback: tuple[PolicyTextIssue, ...] = (),
     ) -> PolicyTextRealization:
-        profile_instruction = STYLE_PROFILES[text_profile]
-        realization_input = self._project_policy_record(policy_record, intent_spec=intent_spec)
         messages = [
             {
                 "role": "system",
@@ -88,32 +79,41 @@ class PolicyTextGenerator:
             {
                 "role": "user",
                 "content": self._user_prompt(
-                    realization_input,
-                    intent_spec=intent_spec,
-                    text_profile=text_profile,
-                    profile_instruction=profile_instruction,
+                    task.realization_input,
+                    intent_spec=task.intent_spec,
+                    retry_feedback=retry_feedback,
                 ),
             },
         ]
+        logger.debug(
+            "PolicyTextGenerator request for %s: %s",
+            task.source_policy.record_id,
+            _preview_text(messages[1]["content"], limit=1000),
+        )
         raw = self.llm.chat_json_result(
             messages,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
         )
         realization = PolicyTextRealization(**raw.data)
-        realization = self._normalize_counterparty_references(
-            realization,
-            counterparty_mention=realization_input.counterparty_mention,
+        logger.debug(
+            "PolicyTextGenerator raw realization for %s: belief=%r thinking=%r",
+            task.source_policy.record_id,
+            realization.belief,
+            realization.thinking,
         )
         issues = self.validate(
             realization,
-            intent_spec=intent_spec,
-            counterparty_mention=realization_input.counterparty_mention,
+            intent_spec=task.intent_spec,
+            counterparty_mention=task.counterparty_mention,
         )
         if issues:
-            raise LLMResponseError(
-                "Policy text realization failed validation: " + "; ".join(issues)
+            logger.debug(
+                "PolicyTextGenerator rule validation issues for %s: %s",
+                task.source_policy.record_id,
+                issues,
             )
+            raise PolicyTextRuleValidationError(issues)
         return realization
 
     def validate(
@@ -122,23 +122,58 @@ class PolicyTextGenerator:
         *,
         intent_spec: IntentSpec,
         counterparty_mention: CounterpartyMention,
-    ) -> list[str]:
-        issues: list[str] = []
+    ) -> list[PolicyTextIssue]:
+        issues: list[PolicyTextIssue] = []
         belief = realization.belief.strip()
         thinking = realization.thinking.strip()
         if not belief:
-            issues.append("belief is empty")
+            issues.append(
+                self._issue(
+                    "belief_empty",
+                    "belief is empty",
+                    "Rewrite belief as a non-empty first-person context sentence.",
+                    field="belief",
+                )
+            )
         if not thinking:
-            issues.append("thinking is empty")
+            issues.append(
+                self._issue(
+                    "thinking_empty",
+                    "thinking is empty",
+                    "Rewrite thinking as a non-empty internal monologue with a visible conclusion.",
+                    field="thinking",
+                )
+            )
         for field_name, text in (("belief", belief), ("thinking", thinking)):
             if text and not self._contains_counterparty_name(text, counterparty_mention):
-                issues.append(f"{field_name} missing counterparty mention/name")
+                issues.append(
+                    self._issue(
+                        "missing_counterparty_name",
+                        f"{field_name} missing counterparty mention/name",
+                        "Use the provided counterparty name or mention explicitly, and repeat it instead of using a pronoun.",
+                        field=field_name,
+                    )
+                )
         if len(belief) > 220:
-            issues.append("belief too long")
+            issues.append(
+                self._issue(
+                    "belief_too_long",
+                    "belief too long",
+                    "Shorten belief while keeping only the most relevant first-person context.",
+                    field="belief",
+                )
+            )
         if len(thinking) > 120:
-            issues.append("thinking too long")
+            issues.append(
+                self._issue(
+                    "thinking_too_long",
+                    "thinking too long",
+                    "Shorten thinking to 1-3 short sentences with a visible reason and conclusion.",
+                    field="thinking",
+                )
+            )
         combined = f"{belief}\n{thinking}"
-        lowered = f"{belief}\n{thinking}".lower()
+        lowered = combined.lower()
         for forbidden in (
             "relation_closeness",
             "trust_in_target",
@@ -157,35 +192,190 @@ class PolicyTextGenerator:
             "first_mention_name",
         ):
             if forbidden in lowered:
-                issues.append(f"contains schema jargon: {forbidden}")
+                issues.append(
+                    self._issue(
+                        "schema_jargon",
+                        f"contains schema jargon: {forbidden}",
+                        "Remove raw schema field names and rewrite the text in natural language.",
+                        details={"term": forbidden},
+                    )
+                )
         if self.language == "zh" and belief and "我" not in belief:
-            issues.append("belief should be first-person in zh")
+            issues.append(
+                self._issue(
+                    "belief_not_first_person",
+                    "belief should be first-person in zh",
+                    "Rewrite belief in first person using 我.",
+                    field="belief",
+                )
+            )
         if self.language == "en" and belief and not re.search(r"\b(i|i'm|i’ve|i'd|i'll|me|my)\b", belief.lower()):
-            issues.append("belief should be first-person in en")
+            issues.append(
+                self._issue(
+                    "belief_not_first_person",
+                    "belief should be first-person in en",
+                    "Rewrite belief in first person using I/me/my.",
+                    field="belief",
+                )
+            )
         if self.language == "zh" and any(address in combined for address in ("你", "您")):
-            issues.append("zh output should not address the counterparty with 你/您")
-        if self.language == "zh" and any(pronoun in combined for pronoun in ("他", "她", "他们", "她们")):
-            issues.append("zh output should not use gendered third-person pronouns for the counterparty")
+            issues.append(
+                self._issue(
+                    "counterparty_direct_address",
+                    "zh output should not address the counterparty with 你/您",
+                    "Do not address the counterparty directly; refer to the person by the provided name instead.",
+                )
+            )
+        if self.language == "zh" and ZH_COUNTERPARTY_PRONOUN_RE.search(combined):
+            issues.append(
+                self._issue(
+                    "counterparty_pronoun",
+                    "zh output should not use gendered third-person pronouns for the counterparty",
+                    "Replace all counterparty pronouns with the provided name or mention.",
+                )
+            )
+        if self.language == "zh" and ZH_COUNTERPARTY_ROMANIZED_PRONOUN_RE.search(combined):
+            issues.append(
+                self._issue(
+                    "counterparty_pronoun",
+                    "zh output should not use ta/TA as a pronoun for the counterparty",
+                    "Replace ta/TA with the provided counterparty name or mention.",
+                )
+            )
+        if self.language == "zh" and any(term in combined for term in GENERIC_COUNTERPARTY_TERMS_ZH):
+            issues.append(
+                self._issue(
+                    "counterparty_generic_placeholder",
+                    "zh output should use the provided counterparty name instead of generic placeholders",
+                    "Replace generic placeholders like 对方 with the provided counterparty name.",
+                )
+            )
         if self.language == "en" and re.search(r"\b(?:you|your)\b", combined.lower()):
-            issues.append("en output should not address the counterparty with standalone you/your")
-        if self.language == "en" and re.search(r"\b(?:he|she|him|his|her|hers|himself|herself)\b", combined.lower()):
-            issues.append("en output should not use gendered third-person pronouns for the counterparty")
+            issues.append(
+                self._issue(
+                    "counterparty_direct_address",
+                    "en output should not address the counterparty with standalone you/your",
+                    "Do not address the counterparty as you/your; use the provided name instead.",
+                )
+            )
+        if self.language == "en" and EN_COUNTERPARTY_PRONOUN_RE.search(combined.lower()):
+            issues.append(
+                self._issue(
+                    "counterparty_pronoun",
+                    "en output should not use pronouns for the counterparty; repeat the provided name instead",
+                    "Replace counterparty pronouns with the provided name or mention.",
+                )
+            )
+        if self.language == "en" and self._contains_any(combined, GENERIC_COUNTERPARTY_TERMS_EN):
+            issues.append(
+                self._issue(
+                    "counterparty_generic_placeholder",
+                    "en output should use the provided counterparty name instead of generic placeholders",
+                    "Replace generic labels like 'the other person' with the provided counterparty name.",
+                )
+            )
         immediate_help_cues = self._immediate_help_cues()
         must_have_cues, must_not_have_cues = self._intent_cues(intent_spec)
-        if not intent_spec.will_help_now and self._contains_any(thinking, immediate_help_cues):
-            issues.append("thinking implies immediate help while will_help_now=false")
-        if intent_spec.will_help_now and not self._contains_any(thinking, immediate_help_cues):
-            issues.append("help_now intent missing immediate-help cue")
+        if not intent_spec.will_help_now and self._contains_affirmative_any(thinking, immediate_help_cues):
+            issues.append(
+                self._issue(
+                    "intent_immediate_help_mismatch",
+                    "thinking implies immediate help while will_help_now=false",
+                    "Rewrite thinking so it does not imply taking the request on right now.",
+                    field="thinking",
+                )
+            )
+        if intent_spec.will_help_now and not self._contains_affirmative_any(thinking, immediate_help_cues):
+            issues.append(
+                self._issue(
+                    "intent_immediate_help_mismatch",
+                    "help_now intent missing immediate-help cue",
+                    "Make thinking explicitly indicate taking the request on now.",
+                    field="thinking",
+                )
+            )
         if must_have_cues and not self._contains_any(thinking, must_have_cues):
-            issues.append(f"{intent_spec.response_intent} intent missing cue")
-        if must_not_have_cues and self._contains_any(thinking, must_not_have_cues):
-            issues.append(f"{intent_spec.response_intent} intent contains conflicting cue")
+            issues.append(
+                self._issue(
+                    "intent_missing_cue",
+                    f"{intent_spec.response_intent} intent missing cue",
+                    f"Use wording that clearly reads as {intent_spec.response_intent}.",
+                    field="thinking",
+                    details={"response_intent": intent_spec.response_intent},
+                )
+            )
+        if must_not_have_cues and self._contains_forbidden_cues(thinking, must_not_have_cues, immediate_help_cues):
+            issues.append(
+                self._issue(
+                    "intent_conflicting_cue",
+                    f"{intent_spec.response_intent} intent contains conflicting cue",
+                    f"Remove wording that makes the text sound like a different intent than {intent_spec.response_intent}.",
+                    field="thinking",
+                    details={"response_intent": intent_spec.response_intent},
+                )
+            )
         return issues
+
+    @staticmethod
+    def _issue(
+        code: str,
+        message: str,
+        repair_instruction: str,
+        *,
+        field: str | None = None,
+        details: dict[str, str | bool] | None = None,
+    ) -> PolicyTextIssue:
+        return PolicyTextIssue(
+            code=code,
+            origin="rule_validator",
+            field=field,
+            message=message,
+            repair_instruction=repair_instruction,
+            details=details or {},
+        )
 
     @staticmethod
     def _contains_any(text: str, cues: tuple[str, ...]) -> bool:
         lowered = text.lower()
         return any(cue.lower() in lowered for cue in cues)
+
+    def _contains_affirmative_any(self, text: str, cues: tuple[str, ...]) -> bool:
+        return any(self._contains_affirmative_phrase(text, cue) for cue in cues)
+
+    def _contains_forbidden_cues(
+        self,
+        text: str,
+        cues: tuple[str, ...],
+        immediate_help_cues: tuple[str, ...],
+    ) -> bool:
+        immediate_set = {cue.lower() for cue in immediate_help_cues}
+        for cue in cues:
+            if cue.lower() in immediate_set:
+                if self._contains_affirmative_phrase(text, cue):
+                    return True
+                continue
+            if cue.lower() in text.lower():
+                return True
+        return False
+
+    def _contains_affirmative_phrase(self, text: str, phrase: str) -> bool:
+        lowered = text.lower()
+        phrase_lower = phrase.lower()
+        start = 0
+        while True:
+            index = lowered.find(phrase_lower, start)
+            if index < 0:
+                return False
+            if not self._is_negated_near_phrase(lowered, index):
+                return True
+            start = index + len(phrase_lower)
+
+    def _is_negated_near_phrase(self, lowered: str, index: int) -> bool:
+        if self.language == "zh":
+            window = lowered[max(0, index - 8):index]
+            return any(token in window for token in ("不", "没", "別", "别", "勿"))
+        window = lowered[max(0, index - 24):index]
+        return any(token in window for token in (" not ", "don't ", "dont ", "can't ", "cannot ", "won't ", "never "))
 
     @staticmethod
     def _contains_counterparty_name(text: str, counterparty_mention: CounterpartyMention) -> bool:
@@ -193,40 +383,6 @@ class PolicyTextGenerator:
             counterparty_mention.first_mention_name in text
             or counterparty_mention.canonical_name in text
         )
-
-    def _normalize_counterparty_references(
-        self,
-        realization: PolicyTextRealization,
-        *,
-        counterparty_mention: CounterpartyMention,
-    ) -> PolicyTextRealization:
-        canonical_name = counterparty_mention.canonical_name
-        belief = realization.belief
-        thinking = realization.thinking
-        if self.language == "en":
-            belief = self._normalize_english_counterparty_pronouns(belief, canonical_name)
-            thinking = self._normalize_english_counterparty_pronouns(thinking, canonical_name)
-        if belief == realization.belief and thinking == realization.thinking:
-            return realization
-        return PolicyTextRealization(
-            belief=belief,
-            thinking=thinking,
-        )
-
-    @staticmethod
-    def _normalize_english_counterparty_pronouns(text: str, canonical_name: str) -> str:
-        normalized = text
-        for pattern in (
-            r"\bhimself\b",
-            r"\bherself\b",
-            r"\bhe\b",
-            r"\bshe\b",
-            r"\bhim\b",
-        ):
-            normalized = re.sub(pattern, canonical_name, normalized, flags=re.IGNORECASE)
-        normalized = re.sub(r"\bhis\b", f"{canonical_name}'s", normalized, flags=re.IGNORECASE)
-        normalized = re.sub(r"\bhers\b", f"{canonical_name}'s", normalized, flags=re.IGNORECASE)
-        return normalized
 
     def _immediate_help_cues(self) -> tuple[str, ...]:
         if self.language == "zh":
@@ -270,54 +426,6 @@ class PolicyTextGenerator:
             )
         return tuple(lines)
 
-    @staticmethod
-    def _select_reason_tags(policy_record: PolicyRecord) -> list[str]:
-        selected = [tag for tag in policy_record.policy.reason_tags if tag in HIGH_SIGNAL_REASON_TAGS]
-        if not selected:
-            selected = [
-                tag for tag in policy_record.policy.reason_tags if tag not in {"cost_acceptable", "risk_acceptable"}
-            ]
-        return selected[:4]
-
-    def _project_policy_record(
-        self,
-        policy_record: PolicyRecord,
-        *,
-        intent_spec: IntentSpec,
-    ) -> PolicyTextRealizationInput:
-        relation_kind = canonical_relation_kind(policy_record.relation.relation_label)
-        counterparty_mention = counterparty_mention_for(policy_record.counterparty, relation_kind)
-        return PolicyTextRealizationInput(
-            counterparty_mention=counterparty_mention,
-            relation=PolicyTextRelationInput(
-                label=policy_record.relation.relation_label,
-                closeness=policy_record.relation.relation_closeness,
-                trust=policy_record.relation.trust_in_target,
-                obligation=policy_record.relation.role_obligation,
-                tension=policy_record.relation.unfinished_tension,
-                reciprocity=policy_record.relation.reciprocity_history,
-                power=policy_record.relation.power_asymmetry,
-            ),
-            state=PolicyTextStateInput(
-                energy=policy_record.state.energy,
-                time_pressure=policy_record.state.time_pressure,
-                clarity=policy_record.state.cognitive_clarity,
-                emotional_activation=policy_record.state.emotional_activation,
-                social_readiness=policy_record.state.social_readiness,
-                confidence=policy_record.state.confidence_in_doing_the_action,
-            ),
-            request_context=PolicyTextRequestContextInput(
-                is_doable_now=policy_record.request_contract.is_doable_now,
-            ),
-            decision=PolicyTextDecisionInput(
-                will_help_now=intent_spec.will_help_now,
-                response_intent=intent_spec.response_intent,
-                policy_decision=policy_record.policy.decision,
-                policy_strategy=policy_record.policy.strategy,
-            ),
-            reason_tags=self._select_reason_tags(policy_record),
-        )
-
     def _system_prompt(self) -> str:
         if self.language == "zh":
             return (
@@ -338,9 +446,9 @@ class PolicyTextGenerator:
         realization_input: PolicyTextRealizationInput,
         *,
         intent_spec: IntentSpec,
-        text_profile: str,
-        profile_instruction: str,
+        retry_feedback: tuple[PolicyTextIssue, ...],
     ) -> str:
+        retry_block = self._retry_feedback_block(retry_feedback)
         if self.language == "zh":
             branch_rule = (
                 "结论必须明确表示：现在不接下处理。"
@@ -350,8 +458,6 @@ class PolicyTextGenerator:
             intent_cue_lines = "".join(self._intent_cue_prompt_lines(intent_spec))
             return (
                 f"Language: {self.language}\n"
-                f"text_profile: {text_profile}\n"
-                f"profile_instruction: {profile_instruction}\n"
                 f"decision: {intent_spec.decision}\n"
                 f"response_intent: {intent_spec.response_intent}\n"
                 f"will_help_now: {json.dumps(intent_spec.will_help_now)}\n"
@@ -366,8 +472,11 @@ class PolicyTextGenerator:
                 "- thinking 必须是 1-3 句短句，给出可见理由和行动结论。\n"
                 "- thinking 必须自然使用 counterparty_mention.first_mention_name 或 counterparty_mention.canonical_name。\n"
                 "- thinking 是内部独白，不要写成发给 counterparty 的直接消息。\n"
-                "- counterparty 必须用姓名或 mention 指代，不要写成第二人称直接对话。\n"
-                "- 不要用 他、她、他们、她们 这类带性别的第三人称代词指代 counterparty。\n"
+                "- counterparty 必须用提供的姓名或 mention 指代；宁可重复姓名，也不要改用代词或泛称。\n"
+                "- 如果再次提到 counterparty，继续重复姓名，例如“叶怀和……叶怀和……”；不要把后续提及改成“他/她/ta”。\n"
+                f"- 这是硬性校验项：只要再次提到 counterparty，就继续写 {realization_input.counterparty_mention.canonical_name} 或 {realization_input.counterparty_mention.first_mention_name}，绝对不要写成他、她、他们、她们、ta、TA。\n"
+                "- 不要用 对方、这个人、那个人 这类泛称替代名字。\n"
+                "- 不要用 他、她、他们、她们、ta、TA 这类代词指代 counterparty。\n"
                 "- thinking 必须符合 response_intent，不要只满足二分类分支。\n"
                 "- reason_tags 只是可参考线索，不是逐条复述清单。\n"
                 "- 不要编造名字、性别、具体任务细节或场景细节。\n"
@@ -375,6 +484,7 @@ class PolicyTextGenerator:
                 f"- defer 类表达应包含这类推迟感：{', '.join(DEFER_CUES_ZH)}。\n"
                 f"- help_now 类表达应包含明确立即帮忙感：{', '.join(IMMEDIATE_HELP_CUES_ZH)}。\n"
                 "- 除提供的 counterparty mention 外，不要输出原始字段名，不要写成长链路推理。\n"
+                f"{retry_block}"
                 "- Return JSON only.\n"
             )
 
@@ -386,8 +496,6 @@ class PolicyTextGenerator:
         intent_cue_lines = "".join(self._intent_cue_prompt_lines(intent_spec))
         return (
             f"Language: {self.language}\n"
-            f"text_profile: {text_profile}\n"
-            f"profile_instruction: {profile_instruction}\n"
             f"decision: {intent_spec.decision}\n"
             f"response_intent: {intent_spec.response_intent}\n"
             f"will_help_now: {json.dumps(intent_spec.will_help_now)}\n"
@@ -403,8 +511,12 @@ class PolicyTextGenerator:
             "- thinking should give a visible reason and action conclusion.\n"
             "- thinking must naturally use counterparty_mention.first_mention_name or counterparty_mention.canonical_name.\n"
             "- thinking is internal monologue, not a direct message to the counterparty.\n"
+            "- Use the provided name or mention for the counterparty; repetition is better than pronouns or generic labels.\n"
+            "- If you mention the counterparty again later, repeat the same provided name again instead of switching to a pronoun.\n"
+            f"- Hard validation rule: every later counterparty mention must repeat exactly {realization_input.counterparty_mention.canonical_name} or {realization_input.counterparty_mention.first_mention_name}, never a pronoun.\n"
+            "- Do not refer to the counterparty as the other person, this person, or that person.\n"
             "- Do not address the counterparty as you or your.\n"
-            "- Do not use he, she, him, his, her, or similar gendered third-person pronouns for the counterparty.\n"
+            "- Do not use he, she, him, his, her, they, them, their, or similar pronouns for the counterparty.\n"
             "- thinking should reflect the given response_intent, not just the binary branch bit.\n"
             "- reason_tags are hints, not a checklist.\n"
             "- Do not invent names, genders, exact tasks, or scene details.\n"
@@ -412,5 +524,28 @@ class PolicyTextGenerator:
             f"- defer-like phrasing should sound delayed, for example: {', '.join(DEFER_CUES_EN)}.\n"
             f"- help-now phrasing should sound immediate, for example: {', '.join(IMMEDIATE_HELP_CUES_EN)}.\n"
             "- Do not output raw field names or long hidden reasoning.\n"
+            f"{retry_block}"
             "- Return JSON only.\n"
         )
+
+    def _retry_feedback_block(self, retry_feedback: tuple[PolicyTextIssue, ...]) -> str:
+        if not retry_feedback:
+            return ""
+        if self.language == "zh":
+            lines = ["- 上一次输出存在以下问题，这次必须逐条修正：\n"]
+        else:
+            lines = ["- The previous attempt failed these checks; fix every item below in this retry:\n"]
+        lines.extend(f"  - {issue.repair_instruction}\n" for issue in retry_feedback)
+        if retry_feedback_needs_name_repetition(retry_feedback):
+            if self.language == "zh":
+                lines.append("  - 这是硬性要求：后续提及 counterparty 时，必须继续重复提供的姓名，不要写成他、她、他们、她们、ta、TA。\n")
+            else:
+                lines.append("  - Hard requirement: every later mention of the counterparty must repeat the provided name, never a pronoun.\n")
+        return "".join(lines)
+
+
+def _preview_text(text: str, *, limit: int) -> str:
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."

@@ -7,33 +7,32 @@ import argparse
 import logging
 import os
 import sys
-from contextlib import closing
+from contextlib import ExitStack
 from pathlib import Path
 
-from api import LLMClient
 from derived_lifecycle import DerivedTaskResult, run_derived_task
 from derived_specs import POLICY_RECORDS_SPEC, POLICY_TEXT_RECORDS_SPEC
 from derived_storage import DerivedRunState, DerivedStorageManager
-from entity_catalog import counterparty_mention_for
 from fs_utils import write_jsonl
 from policy_generator import DEFAULT_PROFILE, PolicyGenerator
 from policy_models import POLICY_GENERATOR_VERSION, PolicyRecord, make_policy_record_id, validate_policy_record
-from policy_text_generator import PolicyTextGenerator, select_text_profile
 from policy_text_models import (
-    PolicyTextArtifactRecord,
-    TEXT_SCHEMA_VERSION,
-    intent_spec_from_decision,
     make_policy_text_record_id,
-    project_policy_text_export,
-    validate_policy_text_artifact,
+    PolicyTextRecord,
+    validate_policy_text_record,
 )
-from relation_catalog import canonical_relation_kind
+from policy_text_preparation import (
+    build_policy_text_record,
+    prepare_policy_text_task,
+    validate_policy_text_record_against_source,
+)
+from policy_text_realizer import PolicyTextRealizer
+from policy_text_runtime import PolicyTextRuntimeConfig, build_policy_text_runtime
 from run_metadata import load_config_doc, utc_now_iso
 from run_paths import resolve_task_run_input
 from run_resolver import resolve_existing_run
 from task_contracts import (
     POLICY_TASK_FAMILY,
-    POLICY_TEXT_TASK_FAMILY,
     make_artifact_ref,
     task_run_scope,
 )
@@ -66,44 +65,64 @@ def _rebuild_policy_records_export_view(storage: DerivedStorageManager) -> int:
     return len(export_records)
 
 
-def _load_validated_policy_text_artifacts(storage: DerivedStorageManager) -> list[PolicyTextArtifactRecord]:
-    artifacts: list[PolicyTextArtifactRecord] = []
+def _load_validated_policy_text_records(storage: DerivedStorageManager) -> list[PolicyTextRecord]:
+    records: list[PolicyTextRecord] = []
     errors: list[str] = []
     for item_key in storage.list_existing_keys():
         raw = storage.read_item(item_key)
         if raw is None:
-            errors.append(f"{item_key}: missing artifact payload")
+            errors.append(f"{item_key}: missing policy_text payload")
             continue
         try:
-            artifacts.append(validate_policy_text_artifact(raw, expected_item_key=item_key))
+            records.append(validate_policy_text_record(raw, expected_item_key=item_key))
         except Exception as exc:
             errors.append(f"{item_key}: {exc}")
     if errors:
         preview = "; ".join(errors[:3])
         extra = "" if len(errors) <= 3 else f" (+{len(errors) - 3} more)"
-        raise ValueError(f"Policy-text artifact contract violations: {preview}{extra}")
-    return artifacts
+        raise ValueError(f"Policy-text contract violations: {preview}{extra}")
+    return records
 
 
 def _rebuild_policy_text_export_view(storage: DerivedStorageManager) -> int:
-    export_records = [
-        project_policy_text_export(artifact).model_dump()
-        for artifact in _load_validated_policy_text_artifacts(storage)
-    ]
+    export_records = [record.model_dump() for record in _load_validated_policy_text_records(storage)]
     write_jsonl(storage.export_path(), export_records)
     return len(export_records)
 
 
-def _validate_existing_policy_text_artifacts(storage: DerivedStorageManager) -> int:
+def _validate_existing_policy_text_records(storage: DerivedStorageManager) -> int:
     try:
-        return len(_load_validated_policy_text_artifacts(storage))
+        return len(_load_validated_policy_text_records(storage))
     except ValueError as exc:
         raise ValueError(
             str(exc).replace(
-                "Policy-text artifact contract violations",
-                "Existing policy-text artifacts failed validation",
+                "Policy-text contract violations",
+                "Existing policy-text records failed validation",
             )
         ) from exc
+
+
+def _validate_policy_text_records_against_source(
+    storage: DerivedStorageManager,
+    source_storage: DerivedStorageManager,
+) -> int:
+    records = _load_validated_policy_text_records(storage)
+    errors: list[str] = []
+    for record in records:
+        raw = source_storage.read_item(record.source_policy_record_id)
+        if raw is None:
+            errors.append(f"{record.record_id}: missing source policy {record.source_policy_record_id}")
+            continue
+        try:
+            source_policy = validate_policy_record(raw, expected_record_id=record.source_policy_record_id)
+            validate_policy_text_record_against_source(record, source_policy)
+        except Exception as exc:
+            errors.append(f"{record.record_id}: {exc}")
+    if errors:
+        preview = "; ".join(errors[:3])
+        extra = "" if len(errors) <= 3 else f" (+{len(errors) - 3} more)"
+        raise ValueError(f"Existing policy-text records diverged from source policy records: {preview}{extra}")
+    return len(records)
 
 
 def _validate_policy_resume_config(run_dir: Path, args: argparse.Namespace) -> None:
@@ -253,12 +272,6 @@ def build_policy_text_records_parser() -> argparse.ArgumentParser:
         help="Sampling temperature for text realization.",
     )
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=7,
-        help="Seed used for deterministic style-profile assignment.",
-    )
-    parser.add_argument(
         "--max-records",
         type=int,
         default=None,
@@ -269,6 +282,11 @@ def build_policy_text_records_parser() -> argparse.ArgumentParser:
         type=int,
         default=3,
         help="Maximum realization attempts per source policy record.",
+    )
+    parser.add_argument(
+        "--judge-model",
+        default=None,
+        help="Model used for semantic judging; defaults to --model when omitted.",
     )
     parser.add_argument(
         "--output-dir",
@@ -426,14 +444,7 @@ def _validate_policy_text_resume_config(run_dir: Path, args: argparse.Namespace)
         )
         sys.exit(1)
     mismatches: list[str] = []
-    expected = {
-        "policy_run_id": args.policy_run_id,
-        "language": args.language,
-        "model": args.model,
-        "temperature": args.temperature,
-        "seed": args.seed,
-        "max_records": args.max_records,
-    }
+    expected = _policy_text_runtime_config_doc(args)
     for key, expected_value in expected.items():
         actual = existing_config.get(key)
         if actual is not None and actual != expected_value:
@@ -444,6 +455,27 @@ def _validate_policy_text_resume_config(run_dir: Path, args: argparse.Namespace)
             file=sys.stderr,
         )
         sys.exit(1)
+
+
+def _policy_text_runtime_config(args: argparse.Namespace) -> PolicyTextRuntimeConfig:
+    return PolicyTextRuntimeConfig(
+        model=args.model,
+        temperature=args.temperature,
+        judge_model=args.judge_model,
+    )
+
+
+def _policy_text_runtime_config_doc(args: argparse.Namespace) -> dict[str, object]:
+    runtime = _policy_text_runtime_config(args)
+    return {
+        "policy_run_id": args.policy_run_id,
+        "language": args.language,
+        "model": runtime.model,
+        "temperature": runtime.temperature,
+        "max_records": args.max_records,
+        "max_attempts": args.max_attempts,
+        "judge_model": runtime.resolved_judge_model,
+    }
 
 
 def run_generate_policy_text_records(args: argparse.Namespace) -> None:
@@ -482,12 +514,7 @@ def run_generate_policy_text_records(args: argparse.Namespace) -> None:
     existing_state = storage.load_run_state() if args.resume else None
     config_doc = {
         "task": "generate_policy_text_records",
-        "policy_run_id": args.policy_run_id,
-        "language": args.language,
-        "model": args.model,
-        "temperature": args.temperature,
-        "seed": args.seed,
-        "max_records": args.max_records,
+        **_policy_text_runtime_config_doc(args),
     }
     lineage_doc = {
         "sources": [
@@ -505,25 +532,37 @@ def run_generate_policy_text_records(args: argparse.Namespace) -> None:
         make_policy_text_record_id(source_key)
         for source_key in source_keys
     }
+    runtime_config = _policy_text_runtime_config(args)
 
     def execute(context) -> DerivedTaskResult:
         started_at = existing_state.started_at if existing_state and existing_state.started_at else context.created_at
         failed_items = storage.count_failure_events() if args.resume else 0
+        judge_rejections = 0
         if args.resume and existing_keys:
             print(f"Resuming — {len(existing_keys)} policy-text records already exist")
-            validated = _validate_existing_policy_text_artifacts(storage)
-            print(f"Validated {validated} existing policy-text artifacts; rebuilding export view ...")
+            validated = _validate_existing_policy_text_records(storage)
+            _validate_policy_text_records_against_source(storage, policy_storage)
+            print(f"Validated {validated} existing policy-text records against their source policies; rebuilding export view ...")
             _rebuild_policy_text_export_view(storage)
         if args.resume and requested_item_keys.issubset(existing_keys):
             print(f"All {len(requested_item_keys)} requested policy-text records already exist, nothing to do.")
         else:
             base_url, api_key = get_llm_env()
-            with closing(LLMClient(base_url=base_url, api_key=api_key, model=args.model)) as llm:
-                generator = PolicyTextGenerator(
-                    llm,
+            with ExitStack() as stack:
+                runtime = build_policy_text_runtime(
+                    stack,
+                    base_url=base_url,
+                    api_key=api_key,
                     language=args.language,
-                    temperature=args.temperature,
+                    config=runtime_config,
                 )
+                logger.info(
+                    "Policy-text generation runtime: generator_model=%s judge_model=%s max_attempts=%s",
+                    runtime_config.model,
+                    runtime_config.resolved_judge_model,
+                    args.max_attempts,
+                )
+                realizer = PolicyTextRealizer(runtime.generator, semantic_judge=runtime.semantic_judge)
                 for index, source_key in enumerate(source_keys, start=1):
                     item_key = make_policy_text_record_id(source_key)
                     if item_key in existing_keys:
@@ -536,42 +575,19 @@ def run_generate_policy_text_records(args: argparse.Namespace) -> None:
                         raise ValueError(
                             f"Source policy record_id {source_policy.record_id!r} does not match item key {source_key!r}"
                         )
-                    intent_spec = intent_spec_from_decision(source_policy.policy.decision)
-                    relation_kind = canonical_relation_kind(source_policy.relation.relation_label)
-                    counterparty_mention = counterparty_mention_for(source_policy.counterparty, relation_kind)
-                    text_profile = select_text_profile(source_policy.record_id, args.seed)
-                    last_error: Exception | None = None
-                    realization = None
-                    for attempt in range(1, args.max_attempts + 1):
-                        logger.info(
-                            "Realizing %s (%d/%d, attempt=%d/%d, will_help_now=%s, response_intent=%s, profile=%s)",
-                            source_policy.record_id,
-                            index,
-                            len(source_keys),
-                            attempt,
-                            args.max_attempts,
-                            intent_spec.will_help_now,
-                            intent_spec.response_intent,
-                            text_profile,
-                        )
-                        try:
-                            realization = generator.generate(
-                                source_policy,
-                                intent_spec=intent_spec,
-                                text_profile=text_profile,
-                            )
-                            last_error = None
-                            break
-                        except Exception as exc:
-                            last_error = exc
-                            logger.warning(
-                                "Policy text realization failed for %s on attempt %d/%d: %s",
-                                source_policy.record_id,
-                                attempt,
-                                args.max_attempts,
-                                exc,
-                            )
-                    if last_error is not None:
+                    logger.info(
+                        "Realizing %s (%d/%d)",
+                        source_policy.record_id,
+                        index,
+                        len(source_keys),
+                    )
+                    task = prepare_policy_text_task(source_policy, language=args.language)
+                    outcome = realizer.realize(
+                        task,
+                        max_attempts=args.max_attempts,
+                    )
+                    judge_rejections += outcome.judge_rejections
+                    if outcome.last_error is not None:
                         failed_items += 1
                         storage.append_failure(
                             {
@@ -580,36 +596,17 @@ def run_generate_policy_text_records(args: argparse.Namespace) -> None:
                                 "source_policy_record_id": source_policy.record_id,
                                 "item_key": item_key,
                                 "failed_at": utc_now_iso(),
-                                "error_type": type(last_error).__name__,
-                                "error": str(last_error),
+                                "error_type": type(outcome.last_error).__name__,
+                                "error": str(outcome.last_error),
                             }
                         )
                         continue
 
-                    if realization is None:
+                    if outcome.realization is None:
                         raise RuntimeError(
                             f"Policy text realization unexpectedly missing for {source_policy.record_id}"
                         )
-                    record = validate_policy_text_artifact(
-                        PolicyTextArtifactRecord(
-                            schema_version=TEXT_SCHEMA_VERSION,
-                            record_id=item_key,
-                            language=args.language,
-                            source_policy_record_id=source_policy.record_id,
-                            relation_kind=relation_kind,
-                            counterparty_entity_id=counterparty_mention.entity_id,
-                            counterparty_canonical_name=counterparty_mention.canonical_name,
-                            counterparty_first_mention_name=counterparty_mention.first_mention_name,
-                            will_help_now=intent_spec.will_help_now,
-                            policy_decision=source_policy.policy.decision,
-                            response_intent=intent_spec.response_intent,
-                            text_profile=text_profile,
-                            belief=realization.belief.strip(),
-                            thinking=realization.thinking.strip(),
-                            source_policy=source_policy,
-                        ),
-                        expected_item_key=item_key,
-                    )
+                    record = build_policy_text_record(task, outcome.realization)
                     storage.write_item(item_key, record.model_dump())
 
         all_keys = storage.list_existing_keys()
@@ -632,9 +629,11 @@ def run_generate_policy_text_records(args: argparse.Namespace) -> None:
                 "generated": generated_requested,
                 "failed_items": failed_items,
                 "export_lines": export_lines,
-                "model": args.model,
-                "temperature": args.temperature,
-                "seed": args.seed,
+                "model": runtime_config.model,
+                "temperature": runtime_config.temperature,
+                "judge_model": runtime_config.resolved_judge_model,
+                "judge_rejections": judge_rejections,
+                "max_attempts": args.max_attempts,
                 "generated_at": finished_at,
             },
             run_state=DerivedRunState(
@@ -661,8 +660,9 @@ def run_generate_policy_text_records(args: argparse.Namespace) -> None:
                 "language": args.language,
                 "requested": len(source_keys),
                 "generated": generated_requested,
-                "model": args.model,
-                "seed": args.seed,
+                "model": runtime_config.model,
+                "judge_model": runtime_config.resolved_judge_model,
+                "max_attempts": args.max_attempts,
                 "failed_at": failed_at,
                 "error": str(exc),
             },

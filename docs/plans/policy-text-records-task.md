@@ -147,63 +147,52 @@ Suggested artifact shape for each text item:
 
 ```json
 {
-  "schema_version": "1.1",
+  "schema_version": "1.4",
   "record_id": "policy_text__policy_rec__000123__r01",
   "language": "zh",
   "source_policy_record_id": "policy_rec__000123",
   "relation_kind": "friend",
-  "will_help_now": false,
   "policy_decision": "defer",
-  "response_intent": "defer",
-  "belief": "老王是我认识很多年的朋友。我们关系一直不错，但我现在正赶一个临时任务，时间特别紧。",
-  "thinking": "我不是不想帮他，只是眼下腾不开手。先说明我现在没法处理，等晚上空下来再帮他。",
-  "text_profile": "warm_brief_v1",
-  "source_policy": {
-    "...": "embedded structured policy record"
-  }
-}
-```
-
-Notes:
-
-- `source_policy` should stay embedded in the artifact record.
-  It is the internal archival snapshot for traceability and validation.
-- `policy_decision` is denormalized for easier filtering without traversing
-  nested fields.
-- `response_intent` keeps surface intent explicit for later composition.
-- `will_help_now` is a branch-control bit, not the only control field.
-- `belief` and `thinking` are human-readable but must not be the only source of
-  truth.
-- `source_policy` is a frozen convenience snapshot in artifacts only.
-  The canonical source of truth remains the upstream `policy_records` item.
-- `relation_kind` must be derived from the embedded source policy relation label
-  rather than guessed independently.
-- artifact is not the public downstream contract for v1; export below is.
-
-Suggested export shape:
-
-```json
-{
-  "schema_version": "1.1",
-  "record_id": "policy_text__policy_rec__000123__r01",
-  "language": "zh",
-  "source_policy_record_id": "policy_rec__000123",
-  "relation_kind": "friend",
-  "will_help_now": false,
-  "policy_decision": "defer",
-  "response_intent": "defer",
   "belief": "老王是我认识很多年的朋友。我们关系一直不错，但我现在正赶一个临时任务，时间特别紧。",
   "thinking": "我不是不想帮他，只是眼下腾不开手。先说明我现在没法处理，等晚上空下来再帮他。"
 }
 ```
 
-The export is intentionally thinner than the artifact.
-It should be rebuilt from artifacts, and rebuild should fail hard if any stored
-artifact violates the producer contract.
+Notes:
+
+- artifact and export now share the same thin record shape
+- `policy_decision` remains the stored control field; `response_intent` and
+  `will_help_now` are derived from it at read time
+- counterparty identity fields are also derived at read time from
+  `source_policy_record_id` plus `relation_kind`
+- `belief` and `thinking` are the only free-text payload; everything else is
+  structural trace or a deterministic projection
+- the canonical source of truth for relation label and decision remains the
+  upstream `policy_records` item, and resume validation should re-check stored
+  text records against that source run
+
+Suggested export shape:
+
+```json
+{
+  "schema_version": "1.4",
+  "record_id": "policy_text__policy_rec__000123__r01",
+  "language": "zh",
+  "source_policy_record_id": "policy_rec__000123",
+  "relation_kind": "friend",
+  "policy_decision": "defer",
+  "belief": "老王是我认识很多年的朋友。我们关系一直不错，但我现在正赶一个临时任务，时间特别紧。",
+  "thinking": "我不是不想帮他，只是眼下腾不开手。先说明我现在没法处理，等晚上空下来再帮他。"
+}
+```
+
+The export intentionally matches the stored item contract.
+It should be rebuilt from items, and rebuild should fail hard if any stored
+record violates the producer contract.
 - keep `source_policy_record_id` as the minimal trace link back to the source
   policy item
-- keep internal generation metadata and embedded `source_policy` in artifacts
-  only
+- derive intent and counterparty identity fields in readers rather than storing
+  them redundantly in each row
 
 
 ## 7. Text Semantics
@@ -276,15 +265,10 @@ Recommended diversity sources:
 Suggested v1 style profile pool:
 
 - `warm_brief`
-- `neutral_direct`
-- `guarded_soft`
-- `busy_practical`
-- `close_relationship_candid`
+Use one stable baseline style.
 
-The style profile is not the semantic truth.
-
-It is a realization hint used to vary wording while preserving the same policy
-record.
+Variation should come from relation/state/intent differences in the source
+policy, not from an extra arbitrary style-profile knob.
 
 
 ## 9. Prompting Guidance
@@ -296,7 +280,6 @@ The model should receive:
 - a compact realization-oriented projection of the source policy
 - the derived binary label `will_help_now`
 - the derived structured `response_intent`
-- one chosen `text_profile`
 - strict output instructions
 
 Preferred output format:

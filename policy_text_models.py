@@ -9,20 +9,18 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from entity_catalog import (
     CounterpartyMention,
     counterparty_mention_for,
-    first_mention_name_for,
     make_counterparty_entity_id,
+    make_counterparty_identity,
 )
-from policy_models import PolicyRecord
 from policy_text_contracts import (
     LanguageCode,
     PolicyDecisionName,
     RelationKind,
     ResponseIntent,
 )
-from relation_catalog import canonical_relation_kind
 
 
-TEXT_SCHEMA_VERSION = "1.2"
+TEXT_SCHEMA_VERSION = "1.4"
 
 
 @dataclass(frozen=True)
@@ -224,17 +222,16 @@ def _require_explicit_contract_fields(
     raw: object,
     *,
     required: set[str],
-    contract_name: str,
 ) -> object:
     if not isinstance(raw, dict):
         return raw
     missing = sorted(required - set(raw))
     if missing:
-        raise ValueError(f"missing required {contract_name} contract fields: {', '.join(missing)}")
+        raise ValueError(f"missing required policy_text fields: {', '.join(missing)}")
     return raw
 
 
-class PolicyTextRecordBase(BaseModel):
+class PolicyTextRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: str = TEXT_SCHEMA_VERSION
@@ -242,17 +239,10 @@ class PolicyTextRecordBase(BaseModel):
     language: LanguageCode
     source_policy_record_id: str
     relation_kind: RelationKind
-    counterparty_entity_id: str
-    counterparty_canonical_name: str
-    counterparty_first_mention_name: str
-    will_help_now: bool
     policy_decision: PolicyDecisionName
-    response_intent: ResponseIntent
     belief: str
     thinking: str
 
-
-class PolicyTextArtifactRecord(PolicyTextRecordBase):
     @model_validator(mode="before")
     @classmethod
     def _require_explicit_contract_fields(cls, raw: object) -> object:
@@ -264,168 +254,67 @@ class PolicyTextArtifactRecord(PolicyTextRecordBase):
                 "language",
                 "source_policy_record_id",
                 "relation_kind",
-                "counterparty_entity_id",
-                "counterparty_canonical_name",
-                "counterparty_first_mention_name",
-                "will_help_now",
                 "policy_decision",
-                "response_intent",
-                "text_profile",
-                "belief",
-                "thinking",
-                "source_policy",
-            },
-            contract_name="artifact",
-        )
-
-    text_profile: str
-    source_policy: PolicyRecord
-
-
-class PolicyTextExportRecord(PolicyTextRecordBase):
-    @model_validator(mode="before")
-    @classmethod
-    def _require_explicit_contract_fields(cls, raw: object) -> object:
-        return _require_explicit_contract_fields(
-            raw,
-            required={
-                "schema_version",
-                "record_id",
-                "language",
-                "source_policy_record_id",
-                "relation_kind",
-                "counterparty_entity_id",
-                "counterparty_canonical_name",
-                "counterparty_first_mention_name",
-                "will_help_now",
-                "policy_decision",
-                "response_intent",
                 "belief",
                 "thinking",
             },
-            contract_name="export",
         )
 
+    @property
+    def intent_spec(self) -> IntentSpec:
+        return intent_spec_from_decision(self.policy_decision)
 
-def validate_policy_text_artifact(
-    raw: dict | PolicyTextArtifactRecord,
+    @property
+    def will_help_now(self) -> bool:
+        return self.intent_spec.will_help_now
+
+    @property
+    def response_intent(self) -> ResponseIntent:
+        return self.intent_spec.response_intent
+
+    @property
+    def counterparty_entity_id(self) -> str:
+        return make_counterparty_entity_id(self.source_policy_record_id)
+
+    @property
+    def counterparty_mention(self) -> CounterpartyMention:
+        return counterparty_mention_for(
+            make_counterparty_identity(self.source_policy_record_id),
+            self.relation_kind,
+        )
+
+    @property
+    def counterparty_canonical_name(self) -> str:
+        return self.counterparty_mention.canonical_name
+
+    @property
+    def counterparty_first_mention_name(self) -> str:
+        return self.counterparty_mention.first_mention_name
+
+
+def validate_policy_text_record(
+    raw: dict | PolicyTextRecord,
     *,
     expected_item_key: str | None = None,
-) -> PolicyTextArtifactRecord:
-    artifact = raw if isinstance(raw, PolicyTextArtifactRecord) else PolicyTextArtifactRecord.model_validate(raw)
-    _validate_policy_text_record_base(artifact, contract_name="artifact")
-    if expected_item_key is not None and artifact.record_id != expected_item_key:
-        raise ValueError(
-            f"artifact record_id {artifact.record_id!r} does not match item key {expected_item_key!r}"
-        )
-
-    expected_record_id = make_policy_text_record_id(
-        artifact.source_policy_record_id,
-    )
-    if artifact.record_id != expected_record_id:
-        raise ValueError(
-            f"artifact record_id {artifact.record_id!r} does not match expected {expected_record_id!r}"
-        )
-
-    if artifact.source_policy.record_id != artifact.source_policy_record_id:
-        raise ValueError(
-            "artifact source_policy_record_id does not match embedded source_policy.record_id"
-        )
-
-    if artifact.policy_decision != artifact.source_policy.policy.decision:
-        raise ValueError("artifact policy_decision does not match embedded source_policy.policy.decision")
-
-    intent_spec = intent_spec_from_decision(artifact.source_policy.policy.decision)
-    if artifact.will_help_now != intent_spec.will_help_now:
-        raise ValueError("artifact will_help_now does not match policy_decision mapping")
-    if artifact.response_intent != intent_spec.response_intent:
-        raise ValueError("artifact response_intent does not match policy_decision mapping")
-
-    expected_relation_kind = canonical_relation_kind(artifact.source_policy.relation.relation_label)
-    if artifact.relation_kind != expected_relation_kind:
-        raise ValueError("artifact relation_kind does not match embedded source_policy relation label")
-
-    expected_mention = counterparty_mention_for(artifact.source_policy.counterparty, expected_relation_kind)
-    actual_counterparty_fields = {
-        "entity_id": artifact.counterparty_entity_id,
-        "canonical_name": artifact.counterparty_canonical_name,
-        "first_mention_name": artifact.counterparty_first_mention_name,
-    }
-    if actual_counterparty_fields != expected_mention.model_dump():
-        raise ValueError("artifact counterparty fields do not match embedded source_policy counterparty mention")
-
-    if not artifact.belief.strip():
-        raise ValueError("artifact belief is empty")
-    if not artifact.thinking.strip():
-        raise ValueError("artifact thinking is empty")
-    return artifact
-
-
-def validate_policy_text_export(
-    raw: dict | PolicyTextExportRecord,
-) -> PolicyTextExportRecord:
-    record = raw if isinstance(raw, PolicyTextExportRecord) else PolicyTextExportRecord.model_validate(raw)
-    _validate_policy_text_record_base(record, contract_name="export")
-    return record
-
-
-def project_policy_text_export(artifact: PolicyTextArtifactRecord) -> PolicyTextExportRecord:
-    validated_artifact = validate_policy_text_artifact(artifact)
-    return validate_policy_text_export(
-        validated_artifact.model_dump(
-            include={
-                "schema_version",
-                "record_id",
-                "language",
-                "source_policy_record_id",
-                "relation_kind",
-                "counterparty_entity_id",
-                "counterparty_canonical_name",
-                "counterparty_first_mention_name",
-                "will_help_now",
-                "policy_decision",
-                "response_intent",
-                "belief",
-                "thinking",
-            }
-        )
-    )
-
-
-def _validate_policy_text_record_base(
-    record: PolicyTextRecordBase,
-    *,
-    contract_name: str,
-) -> None:
+) -> PolicyTextRecord:
+    record = raw if isinstance(raw, PolicyTextRecord) else PolicyTextRecord.model_validate(raw)
     if record.schema_version != TEXT_SCHEMA_VERSION:
         raise ValueError(
-            f"{contract_name} schema_version {record.schema_version!r} does not match expected {TEXT_SCHEMA_VERSION!r}"
+            f"policy_text schema_version {record.schema_version!r} does not match expected {TEXT_SCHEMA_VERSION!r}"
         )
-    if not record.record_id:
-        raise ValueError(f"{contract_name} record_id is empty")
+    if expected_item_key is not None and record.record_id != expected_item_key:
+        raise ValueError(
+            f"policy_text record_id {record.record_id!r} does not match item key {expected_item_key!r}"
+        )
+    expected_record_id = make_policy_text_record_id(record.source_policy_record_id)
+    if record.record_id != expected_record_id:
+        raise ValueError(
+            f"policy_text record_id {record.record_id!r} does not match expected {expected_record_id!r}"
+        )
     if not record.source_policy_record_id:
-        raise ValueError(f"{contract_name} source_policy_record_id is empty")
-    for field_name in (
-        "counterparty_entity_id",
-        "counterparty_canonical_name",
-        "counterparty_first_mention_name",
-    ):
-        if not getattr(record, field_name).strip():
-            raise ValueError(f"{contract_name} {field_name} is empty")
-    expected_entity_id = make_counterparty_entity_id(record.source_policy_record_id)
-    if record.counterparty_entity_id != expected_entity_id:
-        raise ValueError(
-            f"{contract_name} counterparty_entity_id does not match deterministic source policy entity id"
-        )
-    expected_first_mention = first_mention_name_for(
-        record.relation_kind,
-        record.counterparty_canonical_name,
-    )
-    if record.counterparty_first_mention_name != expected_first_mention:
-        raise ValueError(
-            f"{contract_name} counterparty_first_mention_name does not match controlled mention template"
-        )
+        raise ValueError("policy_text source_policy_record_id is empty")
     if not record.belief.strip():
-        raise ValueError(f"{contract_name} belief is empty")
+        raise ValueError("policy_text belief is empty")
     if not record.thinking.strip():
-        raise ValueError(f"{contract_name} thinking is empty")
+        raise ValueError("policy_text thinking is empty")
+    return record

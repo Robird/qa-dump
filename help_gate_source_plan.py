@@ -10,7 +10,7 @@ from typing import Iterator
 
 from payload_adapter import PayloadRecord, QAPayloadAdapter
 from policy_text_contracts import LanguageCode
-from policy_text_models import PolicyTextExportRecord, TEXT_SCHEMA_VERSION, validate_policy_text_export
+from policy_text_models import PolicyTextRecord, TEXT_SCHEMA_VERSION, validate_policy_text_record
 from qa_view import QAViewReader
 from run_paths import resolve_task_run_input
 from run_resolver import ResolvedRun, resolve_existing_run
@@ -57,7 +57,7 @@ class HelpGateSourceRequest:
 class HelpGatePairing:
     index: int
     payload: PayloadRecord
-    policy_text: PolicyTextExportRecord
+    policy_text: PolicyTextRecord
 
 
 @dataclass(frozen=True)
@@ -67,7 +67,7 @@ class HelpGateSourcePlan:
     policy_text_run: ResolvedRun
     qa_reader: QAViewReader
     payloads: tuple[PayloadRecord, ...]
-    policy_text_records: tuple[PolicyTextExportRecord, ...]
+    policy_text_records: tuple[PolicyTextRecord, ...]
     pairing_strategy: str = HELP_GATE_PAIRING_STRATEGY
     qa_view_id: str = QA_VIEW_ID
 
@@ -131,7 +131,7 @@ class HelpGateSourcePlan:
     def sample_payloads(self, count: int = 5) -> list[PayloadRecord]:
         return list(self.payloads[:count])
 
-    def sample_policy_text_records(self, count: int = 3) -> list[PolicyTextExportRecord]:
+    def sample_policy_text_records(self, count: int = 3) -> list[PolicyTextRecord]:
         return list(self.policy_text_records[:count])
 
     def warnings(self) -> list[str]:
@@ -193,18 +193,18 @@ def default_policy_text_run_dir(language: str, run_id: str) -> Path:
     return resolve_task_run_input(POLICY_TEXT_TASK_FAMILY, run_id, language=language)
 
 
-def load_policy_text_export_records(run_dir: str | Path) -> list[PolicyTextExportRecord]:
+def load_policy_text_export_records(run_dir: str | Path) -> list[PolicyTextRecord]:
     path = Path(run_dir) / "views" / "export.jsonl"
     if not path.exists():
         raise FileNotFoundError(f"Policy-text export not found: {path}")
-    records: list[PolicyTextExportRecord] = []
+    records: list[PolicyTextRecord] = []
     with path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             line = line.strip()
             if not line:
                 continue
             try:
-                records.append(validate_policy_text_export(json.loads(line)))
+                records.append(validate_policy_text_record(json.loads(line)))
             except Exception as exc:
                 raise ValueError(
                     "Invalid policy-text export record "
@@ -243,7 +243,7 @@ def build_help_gate_source_plan(
     qa_run: ResolvedRun,
     policy_text_run: ResolvedRun,
     qa_reader: QAViewReader,
-    policy_text_records: list[PolicyTextExportRecord],
+    policy_text_records: list[PolicyTextRecord],
 ) -> HelpGateSourcePlan:
     adapter = QAPayloadAdapter(str(qa_run.run_dir))
     payloads = load_filtered_payloads(
@@ -286,7 +286,7 @@ def _resolve_qa_run(request: HelpGateSourceRequest) -> tuple[ResolvedRun, QAView
 
 def _resolve_policy_text_run(
     request: HelpGateSourceRequest,
-) -> tuple[ResolvedRun, list[PolicyTextExportRecord]]:
+) -> tuple[ResolvedRun, list[PolicyTextRecord]]:
     try:
         policy_text_run = resolve_existing_run(
             task_family=POLICY_TEXT_TASK_FAMILY,
