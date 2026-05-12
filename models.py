@@ -71,12 +71,6 @@ class QuestionListResponse(BaseModel):
     questions: list[QuestionCandidate] = Field(default_factory=list)
 
 
-class AnswerResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    answer: str
-
-
 class AnswerItem(BaseModel):
     question_id: str
     question: str = ""

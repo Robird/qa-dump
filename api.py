@@ -53,6 +53,12 @@ class ChatJSONResult:
 
 
 @dataclass(frozen=True)
+class ChatTextResult:
+    content: str
+    reasoning_content: str = ""
+
+
+@dataclass(frozen=True)
 class ChatToolCallResult:
     tool_name: str
     arguments: dict[str, Any]
@@ -117,6 +123,25 @@ class LLMClient:
     ) -> ChatJSONResult:
         raw = self._post(self._build_chat_body(messages, temperature, max_tokens))
         return self._parse_chat_json_result(raw)
+
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=2, max=60),
+        retry=retry_if_exception(_is_retryable_exception),
+        before_sleep=before_sleep_log(logger, logging.WARNING),
+    )
+    def chat_text_result(
+        self,
+        messages: list[dict],
+        temperature: float = 0.3,
+        max_tokens: Optional[int] = None,
+    ) -> ChatTextResult:
+        # Some tasks only need the model's natural-language answer while still
+        # preserving reasoning capture. Keep this path separate from JSON/tool
+        # contracts so callers do not force long-form text through a fake
+        # one-field schema.
+        raw = self._post(self._build_text_body(messages, temperature, max_tokens))
+        return self._parse_chat_text_result(raw)
 
     def chat_structured(
         self,
@@ -208,6 +233,21 @@ class LLMClient:
             body["max_tokens"] = max_tokens
         return body
 
+    def _build_text_body(
+        self,
+        messages: list[dict],
+        temperature: float,
+        max_tokens: Optional[int],
+    ) -> dict[str, Any]:
+        body = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+        }
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
+        return body
+
     def _build_tool_call_body(
         self,
         messages: list[dict],
@@ -288,6 +328,22 @@ class LLMClient:
         return ChatJSONResult(
             data=cls._extract_json(raw_response),
             reasoning_content=cls._extract_reasoning_content(raw_response),
+        )
+
+    @classmethod
+    def _parse_chat_text_result(cls, raw_response: dict) -> ChatTextResult:
+        message = cls._extract_message(raw_response)
+        content = cls._normalize_message_content(message.get("content", ""))
+        reasoning = cls._extract_reasoning_content(raw_response)
+        if not content:
+            finish_reason = raw_response.get("choices", [{}])[0].get("finish_reason", "unknown")
+            raise LLMResponseError(
+                "Empty content from model when text was expected. "
+                f"finish_reason={finish_reason!r}, reasoning_preview={reasoning[:200]!r}"
+            )
+        return ChatTextResult(
+            content=content,
+            reasoning_content=reasoning,
         )
 
     @classmethod

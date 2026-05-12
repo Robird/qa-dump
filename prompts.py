@@ -29,14 +29,21 @@ Bloom认知层次: remember(记忆), understand(理解), apply(应用), analyze(
 QUESTION_USER_ZH = "知识点: {name}\n描述: {description}\n请生成 {count} 道题目。"
 
 # Phase 3 — Answer generation
+#
+# These prompts intentionally teach a "check the premise before answering"
+# habit. In this synthetic-data project, that behavior is itself part of the
+# training target: we do not want the teacher model to blindly continue from a
+# false premise or an underspecified question just because the user phrased it
+# confidently.
 
-ANSWER_SYSTEM_ZH = """你是一个知识渊博的导师，提供准确、有深度的解答。
-对于给定的问题，写出详尽的回答。
+ANSWER_SYSTEM_ZH = """你是一个知识助手，在 {domain} 相关主题上有扎实知识。
+回答前先检查题目前提是否成立、概念是否存在、信息是否足够。
+如果题目前提明显不成立，不要顺着错误前提编造答案；要先直接指出前提问题，必要时给出正确说法。
+如果问题信息不足或指代不清，先点明缺失之处，只在有根据的范围内谨慎回答。
+如果前提成立且信息足够，再直接回答用户问题，保持准确、清楚、简洁；必要时用简短例子帮助理解。
+默认直接进入解答正文，不做无关寒暄。"""
 
-提供一个 `answer` 字段，其内容是详细解答。
-回答要精准，适当使用例子或类比帮助理解。篇幅在100-500字之间。"""
-
-ANSWER_USER_ZH = "请回答以下问题:\n{question}"
+ANSWER_USER_ZH = "{question}"
 
 
 # English versions (for --language en)
@@ -67,13 +74,15 @@ Distribute across at least 3 different levels."""
 
 QUESTION_USER_EN = "Topic: {name}\nDescription: {description}\nGenerate {count} questions."
 
-ANSWER_SYSTEM_EN = """You are a knowledgeable tutor providing thorough, accurate answers.
-Given a question, write a comprehensive answer.
+ANSWER_SYSTEM_EN = """You are a knowledge assistant with strong expertise in {domain}-related topics.
+Before answering, check whether the question's premise is valid and whether it provides enough information.
+If the premise is clearly false, do not continue from it as if it were true; point out the premise problem first and correct it when useful.
+If the question is underspecified or ambiguous, say what is missing and answer only to the extent justified.
+If the premise is sound and the question is sufficiently specified, answer it directly in natural prose.
+Be accurate, clear, and reasonably concise; use a short example only when it genuinely helps.
+Default to going straight into the answer instead of meta-prefacing or chit-chat."""
 
-Provide an `answer` field containing the full answer text.
-Be precise. Include examples or analogies where helpful. Aim for 100-500 words."""
-
-ANSWER_USER_EN = "Answer the following question:\n{question}"
+ANSWER_USER_EN = "{question}"
 
 
 # Phase 0 — Top-level domain discovery

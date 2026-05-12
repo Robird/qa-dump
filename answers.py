@@ -53,16 +53,27 @@ class AnswerGenerator:
             logger.info("Answering %s [%s]", question.id, question.node_path)
 
             messages = [
-                {"role": "system", "content": self.p["answer_system"]},
+                {
+                    "role": "system",
+                    "content": self.p["answer_system"].format(domain=tree.domain),
+                },
                 {"role": "user", "content": self.p["answer_user"].format(question=question.text)},
             ]
             try:
-                # Long-form answers are the last remaining legacy structured path.
-                # We are standardizing new structured outputs on tool calls, but
-                # this call stays on chat_json_result until we finish a more
-                # targeted migration for long answer payloads and reasoning capture.
-                response = self.llm.chat_json_result(messages)
-                answer_text = str(response.data.get("answer", "")).strip()
+                # QA answers are intentionally free-text rather than structured
+                # output: the model only needs to generate the answer body,
+                # while question id/path metadata is already known and is
+                # stitched in by code after the call. This keeps reasoning
+                # capture clean and avoids forcing long answers through a fake
+                # one-field JSON envelope.
+                #
+                # Just as importantly, this stage is meant to teach answer-time
+                # epistemic discipline: if a generated question carries a false
+                # premise or is underspecified, the teacher should notice that
+                # in the answer itself instead of confidently role-playing the
+                # bad premise as true.
+                response = self.llm.chat_text_result(messages)
+                answer_text = response.content.strip()
                 if not answer_text:
                     raise LLMResponseError("Model returned empty answer")
 
