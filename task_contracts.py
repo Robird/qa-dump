@@ -9,11 +9,13 @@ RunScope = Literal["shared", "language"]
 
 QA_TASK_FAMILY = "qa_corpus"
 POLICY_TASK_FAMILY = "policy_records"
-HELP_GATE_TASK_FAMILY = "help_gate_augment"
+POLICY_TEXT_TASK_FAMILY = "policy_text_records"
+HELP_GATE_TASK_FAMILY = "help_gate_acml"
 
 TASK_FAMILY_RUN_SCOPES: dict[str, RunScope] = {
     QA_TASK_FAMILY: "language",
     POLICY_TASK_FAMILY: "shared",
+    POLICY_TEXT_TASK_FAMILY: "language",
     HELP_GATE_TASK_FAMILY: "language",
 }
 

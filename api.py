@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 import json
 import logging
-import re
 from typing import Optional
 from typing import Any
 
@@ -124,25 +123,27 @@ class LLMClient:
             raise LLMResponseError(f"Unexpected response structure: {e}")
 
         cleaned = LLMClient._normalize_message_content(message.get("content", ""))
-        if not cleaned:
+        reasoning = LLMClient._extract_reasoning_content(raw_response).strip()
+        attempts: list[tuple[str, str]] = []
+        if cleaned:
+            attempts.append(("content", cleaned))
+        if reasoning:
+            attempts.append(("reasoning_content", reasoning))
+
+        if not attempts:
             finish_reason = raw_response.get("choices", [{}])[0].get("finish_reason", "unknown")
-            reasoning = LLMClient._extract_reasoning_content(raw_response).strip()
             raise LLMResponseError(
                 "Empty content from model when JSON was expected. "
                 f"finish_reason={finish_reason!r}, reasoning_preview={reasoning[:200]!r}"
             )
 
-        cleaned = LLMClient._strip_code_fences(cleaned)
-        candidate = LLMClient._extract_json_candidate(cleaned)
-
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError as e:
-            snippet = cleaned[:500]
-            raise LLMResponseError(f"Invalid JSON from model: {e}\nContent preview: {snippet}")
-        if not isinstance(parsed, dict):
-            raise LLMResponseError(f"Expected JSON object from model, got {type(parsed).__name__}")
-        return parsed
+        errors: list[str] = []
+        for source_name, source_text in attempts:
+            try:
+                return LLMClient._parse_json_object_text(source_text)
+            except LLMResponseError as exc:
+                errors.append(f"{source_name}: {exc}")
+        raise LLMResponseError("Invalid JSON from model. " + " | ".join(errors))
 
     @staticmethod
     def _normalize_message_content(content: Any) -> str:
@@ -174,14 +175,56 @@ class LLMClient:
         return cleaned
 
     @staticmethod
-    def _extract_json_candidate(content: str) -> str:
-        stripped = content.strip()
-        if stripped.startswith("{") and stripped.endswith("}"):
-            return stripped
-        match = re.search(r"\{.*\}", stripped, flags=re.DOTALL)
-        if match:
-            return match.group(0)
-        return stripped
+    def _parse_json_object_text(content: str) -> dict:
+        cleaned = LLMClient._strip_code_fences(content)
+        candidates = [cleaned.strip()]
+        extracted = LLMClient._extract_first_balanced_json_object(cleaned)
+        if extracted and extracted not in candidates:
+            candidates.append(extracted)
+        last_error: str | None = None
+        for candidate in candidates:
+            if not candidate:
+                continue
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError as exc:
+                last_error = f"{exc}; content preview: {candidate[:500]}"
+                continue
+            if not isinstance(parsed, dict):
+                last_error = f"Expected JSON object, got {type(parsed).__name__}"
+                continue
+            return parsed
+        raise LLMResponseError(last_error or "No JSON object candidate found")
+
+    @staticmethod
+    def _extract_first_balanced_json_object(content: str) -> str:
+        text = content.strip()
+        start = text.find("{")
+        if start < 0:
+            return ""
+        depth = 0
+        in_string = False
+        escape = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+                continue
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : index + 1]
+        return ""
 
     @staticmethod
     def _extract_reasoning_content(raw_response: dict) -> str:

@@ -5,30 +5,79 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
-from collections import Counter
+from contextlib import closing
 from pathlib import Path
 
+from api import LLMClient
 from derived_lifecycle import DerivedTaskResult, run_derived_task
-from derived_specs import HELP_GATE_PREFLIGHT_SPEC, POLICY_RECORDS_SPEC
+from derived_specs import POLICY_RECORDS_SPEC, POLICY_TEXT_RECORDS_SPEC
 from derived_storage import DerivedRunState, DerivedStorageManager
-from payload_adapter import QAPayloadAdapter
+from fs_utils import write_jsonl
 from policy_generator import DEFAULT_PROFILE, PolicyGenerator
-from policy_models import make_policy_record_id
-from qa_view import QAViewReader
+from policy_models import PolicyRecord, make_policy_record_id
+from policy_text_generator import PolicyTextGenerator, select_text_profile
+from policy_text_models import (
+    PolicyTextArtifactRecord,
+    TEXT_SCHEMA_VERSION,
+    intent_spec_from_decision,
+    make_policy_text_record_id,
+    project_policy_text_export,
+    validate_policy_text_artifact,
+)
+from relation_catalog import canonical_relation_kind
 from run_metadata import load_config_doc, utc_now_iso
 from run_paths import resolve_task_run_input
 from run_resolver import resolve_existing_run
 from task_contracts import (
-    HELP_GATE_TASK_FAMILY,
     POLICY_TASK_FAMILY,
-    QA_TASK_FAMILY,
-    QA_VIEW_ID,
+    POLICY_TEXT_TASK_FAMILY,
     make_artifact_ref,
     task_run_scope,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _load_validated_policy_text_artifacts(storage: DerivedStorageManager) -> list[PolicyTextArtifactRecord]:
+    artifacts: list[PolicyTextArtifactRecord] = []
+    errors: list[str] = []
+    for item_key in storage.list_existing_keys():
+        raw = storage.read_item(item_key)
+        if raw is None:
+            errors.append(f"{item_key}: missing artifact payload")
+            continue
+        try:
+            artifacts.append(validate_policy_text_artifact(raw, expected_item_key=item_key))
+        except Exception as exc:
+            errors.append(f"{item_key}: {exc}")
+    if errors:
+        preview = "; ".join(errors[:3])
+        extra = "" if len(errors) <= 3 else f" (+{len(errors) - 3} more)"
+        raise ValueError(f"Policy-text artifact contract violations: {preview}{extra}")
+    return artifacts
+
+
+def _rebuild_policy_text_export_view(storage: DerivedStorageManager) -> int:
+    export_records = [
+        project_policy_text_export(artifact).model_dump()
+        for artifact in _load_validated_policy_text_artifacts(storage)
+    ]
+    write_jsonl(storage.export_path(), export_records)
+    return len(export_records)
+
+
+def _validate_existing_policy_text_artifacts(storage: DerivedStorageManager) -> int:
+    try:
+        return len(_load_validated_policy_text_artifacts(storage))
+    except ValueError as exc:
+        raise ValueError(
+            str(exc).replace(
+                "Policy-text artifact contract violations",
+                "Existing policy-text artifacts failed validation",
+            )
+        ) from exc
 
 
 def _validate_policy_resume_config(run_dir: Path, args: argparse.Namespace) -> None:
@@ -69,12 +118,17 @@ def configure_logging(verbose: bool) -> None:
     )
 
 
-def default_qa_run_dir(language: str, run_id: str) -> Path:
-    return resolve_task_run_input(QA_TASK_FAMILY, run_id, language=language)
-
-
 def default_policy_run_dir(run_id: str) -> Path:
     return resolve_task_run_input(POLICY_TASK_FAMILY, run_id)
+
+
+def get_llm_env() -> tuple[str, str]:
+    base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    if not api_key:
+        print("Error: DEEPSEEK_API_KEY environment variable is required.", file=sys.stderr)
+        sys.exit(1)
+    return base_url, api_key
 
 
 def _write_policy_records(
@@ -134,16 +188,15 @@ def build_policy_records_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def add_help_gate_preflight_arguments(parser: argparse.ArgumentParser) -> None:
+def build_policy_text_records_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Generate language-specific text realizations for policy records.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument(
         "--run-id",
         required=True,
-        help="Current help-gate run id.",
-    )
-    parser.add_argument(
-        "--qa-run-id",
-        required=True,
-        help="Source QA run id.",
+        help="Current policy-text run id.",
     )
     parser.add_argument(
         "--policy-run-id",
@@ -151,48 +204,54 @@ def add_help_gate_preflight_arguments(parser: argparse.ArgumentParser) -> None:
         help="Source policy-record run id.",
     )
     parser.add_argument(
-        "--qa-run-dir",
-        default=None,
-        help="Explicit source QA run directory (overrides --language/--qa-run-id lookup)",
-    )
-    parser.add_argument(
         "--policy-run-dir",
         default=None,
-        help="Explicit source policy-record run directory (overrides --policy-run-id lookup)",
-    )
-    parser.add_argument(
-        "--domains",
-        nargs="*",
-        default=None,
-        help="Limit to specific QA export domain slugs",
-    )
-    parser.add_argument(
-        "--bloom-levels",
-        nargs="*",
-        default=None,
-        help="Limit to specific bloom levels",
-    )
-    parser.add_argument(
-        "--max-records",
-        type=int,
-        default=None,
-        help="Maximum payload records to load (for preflight sampling)",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=None,
-        help="Explicit output directory for the current help-gate run",
+        help="Explicit source policy-record run directory.",
     )
     parser.add_argument(
         "--language",
         default="zh",
         choices=["zh", "en"],
-        help="Language scope for the help-gate run and QA lookup",
+        help="Output language for the text realizations.",
+    )
+    parser.add_argument(
+        "--model",
+        default="deepseek-v4-flash",
+        help="Model used to realize belief/thinking text.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.8,
+        help="Sampling temperature for text realization.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=7,
+        help="Seed used for deterministic style-profile assignment.",
+    )
+    parser.add_argument(
+        "--max-records",
+        type=int,
+        default=None,
+        help="Maximum number of source policy records to realize.",
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=3,
+        help="Maximum realization attempts per source policy record.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Explicit output directory for the current policy-text run",
     )
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Reserved flag for future resumable help-gate tasks",
+        help="Resume by skipping already-completed items",
     )
     parser.add_argument(
         "--verbose",
@@ -200,6 +259,7 @@ def add_help_gate_preflight_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Verbose logging",
     )
+    return parser
 
 
 def run_generate_policy_records(args: argparse.Namespace) -> None:
@@ -224,7 +284,6 @@ def run_generate_policy_records(args: argparse.Namespace) -> None:
         "count_requested": args.count,
         "seed": args.seed,
         "sampler_profile": DEFAULT_PROFILE.name,
-        "resume": args.resume,
     }
     lineage_doc = {"sources": []}
     result_holder: dict[str, object] = {}
@@ -274,14 +333,11 @@ def run_generate_policy_records(args: argparse.Namespace) -> None:
                 "generated_at": finished_at,
             },
             run_state=DerivedRunState(
-                task_name=POLICY_RECORDS_SPEC.task_name,
-                run_id=args.run_id,
                 total_items=max(args.count, len(all_keys)),
                 completed_count=len(all_keys),
                 failed_count=0,
                 started_at=started_at,
                 updated_at=finished_at,
-                last_cursor=all_keys[-1] if all_keys else "",
             ),
         )
 
@@ -301,14 +357,11 @@ def run_generate_policy_records(args: argparse.Namespace) -> None:
                 "error": str(exc),
             },
             run_state=DerivedRunState(
-                task_name=POLICY_RECORDS_SPEC.task_name,
-                run_id=args.run_id,
                 total_items=max(args.count, len(all_keys)),
                 completed_count=len(all_keys),
                 failed_count=1,
                 started_at=started_at,
                 updated_at=failed_at,
-                last_cursor=all_keys[-1] if all_keys else "",
             ),
         )
 
@@ -334,210 +387,265 @@ def run_generate_policy_records(args: argparse.Namespace) -> None:
     )
 
 
-def run_help_gate_preflight(args: argparse.Namespace) -> None:
-    try:
-        qa_run = resolve_existing_run(
-            task_family=QA_TASK_FAMILY,
-            run_id=args.qa_run_id,
-            language=args.language,
-            run_scope=task_run_scope(QA_TASK_FAMILY),
-            run_dir=args.qa_run_dir,
-        )
-        QAViewReader.from_input(qa_run.run_dir)
-    except (FileNotFoundError, ValueError) as exc:
-        qa_run_dir = Path(args.qa_run_dir) if args.qa_run_dir else default_qa_run_dir(args.language, args.qa_run_id)
-        print(f"Invalid QA run directory {qa_run_dir}: {exc}", file=sys.stderr)
-        sys.exit(1)
-    qa_run_dir = qa_run.run_dir
-
-    try:
-        policy_run = resolve_existing_run(
-            task_family=POLICY_TASK_FAMILY,
-            run_id=args.policy_run_id,
-            run_scope=task_run_scope(POLICY_TASK_FAMILY),
-            run_dir=args.policy_run_dir,
-        )
-    except (FileNotFoundError, ValueError) as exc:
-        policy_run_dir = Path(args.policy_run_dir) if args.policy_run_dir else default_policy_run_dir(args.policy_run_id)
-        print(f"Invalid policy run directory {policy_run_dir}: {exc}", file=sys.stderr)
+def _validate_policy_text_resume_config(run_dir: Path, args: argparse.Namespace) -> None:
+    existing_config = load_config_doc(run_dir)
+    if existing_config is None:
+        return
+    if existing_config.get("task") != "generate_policy_text_records":
         print(
-            "Generate policy records first, for example:\n"
-            f"  python policy_records_main.py --run-id {args.policy_run_id}"
-            + (f" --output-dir {args.policy_run_dir}" if args.policy_run_dir else ""),
+            f"Cannot resume non-policy-text run in {run_dir}: "
+            f"task={existing_config.get('task')!r}",
             file=sys.stderr,
         )
         sys.exit(1)
-    policy_run_dir = policy_run.run_dir
+    mismatches: list[str] = []
+    expected = {
+        "policy_run_id": args.policy_run_id,
+        "language": args.language,
+        "model": args.model,
+        "temperature": args.temperature,
+        "seed": args.seed,
+        "max_records": args.max_records,
+    }
+    for key, expected_value in expected.items():
+        actual = existing_config.get(key)
+        if actual is not None and actual != expected_value:
+            mismatches.append(f"{key}={actual!r} (requested {expected_value!r})")
+    if mismatches:
+        print(
+            f"Resume config mismatch for {run_dir}: " + ", ".join(mismatches),
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
+
+def run_generate_policy_text_records(args: argparse.Namespace) -> None:
+    policy_run = resolve_existing_run(
+        task_family=POLICY_TASK_FAMILY,
+        run_id=args.policy_run_id,
+        run_scope=task_run_scope(POLICY_TASK_FAMILY),
+        run_dir=args.policy_run_dir,
+    )
+    policy_storage = DerivedStorageManager(policy_run.run_dir, POLICY_RECORDS_SPEC.task_name)
+    source_keys = policy_storage.list_existing_keys()
+    if not source_keys:
+        print(f"No source policy records found in {policy_run.run_dir}", file=sys.stderr)
+        sys.exit(1)
+    if args.max_records is not None:
+        source_keys = source_keys[: args.max_records]
+
+    run_dir = POLICY_TEXT_RECORDS_SPEC.resolve_run_dir(
+        args.run_id,
+        output_dir=args.output_dir,
+        language=args.language,
+    )
+    storage = DerivedStorageManager(run_dir, POLICY_TEXT_RECORDS_SPEC.task_name)
+    storage.setup()
+    existing_keys = set(storage.list_existing_keys())
+    if existing_keys and not args.resume:
+        print(
+            f"Policy-text run directory already contains {len(existing_keys)} items: {run_dir}\n"
+            "Use --resume to continue this run, or choose a new --run-id / --output-dir.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if args.resume:
+        _validate_policy_text_resume_config(run_dir, args)
+
+    existing_state = storage.load_run_state() if args.resume else None
     config_doc = {
-        "task": "help_gate_preflight",
-        "resume": args.resume,
+        "task": "generate_policy_text_records",
+        "policy_run_id": args.policy_run_id,
+        "language": args.language,
+        "model": args.model,
+        "temperature": args.temperature,
+        "seed": args.seed,
+        "max_records": args.max_records,
     }
     lineage_doc = {
         "sources": [
             {
-                "task_family": QA_TASK_FAMILY,
-                "run_id": args.qa_run_id,
-                "path": str(qa_run_dir),
-                "use": "payload_adapter",
-                "artifact_ref": make_artifact_ref(QA_TASK_FAMILY, args.qa_run_id, "view", QA_VIEW_ID),
-                "filters": {
-                    "domains": args.domains,
-                    "bloom_levels": args.bloom_levels,
-                    "max_records": args.max_records,
-                },
-            },
-            {
-                "task_family": POLICY_RECORDS_SPEC.task_family,
+                "task_family": POLICY_TASK_FAMILY,
                 "run_id": args.policy_run_id,
-                "path": str(policy_run_dir),
-                "use": "policy_source",
-                "artifact_ref": make_artifact_ref(POLICY_RECORDS_SPEC.task_family, args.policy_run_id, "artifact", "items"),
-            },
+                "path": str(policy_run.run_dir),
+                "use": "policy_text_source",
+                "artifact_ref": make_artifact_ref(POLICY_TASK_FAMILY, args.policy_run_id, "artifact", "items"),
+            }
         ]
     }
     result_holder: dict[str, object] = {}
+    requested_item_keys = {
+        make_policy_text_record_id(source_key)
+        for source_key in source_keys
+    }
 
     def execute(context) -> DerivedTaskResult:
-        started_at = context.created_at
-        print(f"Loading payloads from {qa_run_dir / 'views' / QA_VIEW_ID} ...")
-        adapter = QAPayloadAdapter(str(qa_run_dir))
-
-        bloom_filter = set(args.bloom_levels) if args.bloom_levels else None
-        domain_slugs = args.domains
-
-        if domain_slugs:
-            all_payloads: list = []
-            for slug in domain_slugs:
-                remaining = None
-                if args.max_records is not None:
-                    remaining = max(0, args.max_records - len(all_payloads))
-                    if remaining == 0:
-                        break
-                all_payloads.extend(
-                    adapter.discover(domain_slug=slug, bloom_filter=bloom_filter, max_records=remaining)
-                )
+        started_at = existing_state.started_at if existing_state and existing_state.started_at else context.created_at
+        failed_items = storage.count_failure_events() if args.resume else 0
+        if args.resume and existing_keys:
+            print(f"Resuming — {len(existing_keys)} policy-text records already exist")
+            validated = _validate_existing_policy_text_artifacts(storage)
+            print(f"Validated {validated} existing policy-text artifacts; rebuilding export view ...")
+            _rebuild_policy_text_export_view(storage)
+        if args.resume and requested_item_keys.issubset(existing_keys):
+            print(f"All {len(requested_item_keys)} requested policy-text records already exist, nothing to do.")
         else:
-            all_payloads = adapter.discover(bloom_filter=bloom_filter, max_records=args.max_records)
+            base_url, api_key = get_llm_env()
+            with closing(LLMClient(base_url=base_url, api_key=api_key, model=args.model)) as llm:
+                generator = PolicyTextGenerator(
+                    llm,
+                    language=args.language,
+                    temperature=args.temperature,
+                )
+                for index, source_key in enumerate(source_keys, start=1):
+                    item_key = make_policy_text_record_id(source_key)
+                    if item_key in existing_keys:
+                        continue
+                    raw = policy_storage.read_item(source_key)
+                    if raw is None:
+                        raise FileNotFoundError(f"Missing source policy record: {source_key}")
+                    source_policy = PolicyRecord(**raw)
+                    if source_policy.record_id != source_key:
+                        raise ValueError(
+                            f"Source policy record_id {source_policy.record_id!r} does not match item key {source_key!r}"
+                        )
+                    intent_spec = intent_spec_from_decision(source_policy.policy.decision)
+                    relation_kind = canonical_relation_kind(source_policy.relation.relation_label)
+                    text_profile = select_text_profile(source_policy.record_id, args.seed)
+                    last_error: Exception | None = None
+                    realization = None
+                    for attempt in range(1, args.max_attempts + 1):
+                        logger.info(
+                            "Realizing %s (%d/%d, attempt=%d/%d, will_help_now=%s, response_intent=%s, profile=%s)",
+                            source_policy.record_id,
+                            index,
+                            len(source_keys),
+                            attempt,
+                            args.max_attempts,
+                            intent_spec.will_help_now,
+                            intent_spec.response_intent,
+                            text_profile,
+                        )
+                        try:
+                            realization = generator.generate(
+                                source_policy,
+                                intent_spec=intent_spec,
+                                text_profile=text_profile,
+                            )
+                            last_error = None
+                            break
+                        except Exception as exc:
+                            last_error = exc
+                            logger.warning(
+                                "Policy text realization failed for %s on attempt %d/%d: %s",
+                                source_policy.record_id,
+                                attempt,
+                                args.max_attempts,
+                                exc,
+                            )
+                    if last_error is not None:
+                        failed_items += 1
+                        storage.append_failure(
+                            {
+                                "task_name": POLICY_TEXT_RECORDS_SPEC.task_name,
+                                "run_id": args.run_id,
+                                "source_policy_record_id": source_policy.record_id,
+                                "item_key": item_key,
+                                "failed_at": utc_now_iso(),
+                                "error_type": type(last_error).__name__,
+                                "error": str(last_error),
+                            }
+                        )
+                        continue
 
-        print(f"  Loaded {len(all_payloads)} payload records")
+                    if realization is None:
+                        raise RuntimeError(
+                            f"Policy text realization unexpectedly missing for {source_policy.record_id}"
+                        )
+                    record = validate_policy_text_artifact(
+                        PolicyTextArtifactRecord(
+                            schema_version=TEXT_SCHEMA_VERSION,
+                            record_id=item_key,
+                            language=args.language,
+                            source_policy_record_id=source_policy.record_id,
+                            relation_kind=relation_kind,
+                            will_help_now=intent_spec.will_help_now,
+                            policy_decision=source_policy.policy.decision,
+                            response_intent=intent_spec.response_intent,
+                            text_profile=text_profile,
+                            belief=realization.belief.strip(),
+                            thinking=realization.thinking.strip(),
+                            source_policy=source_policy,
+                        ),
+                        expected_item_key=item_key,
+                    )
+                    storage.write_item(item_key, record.model_dump())
 
-        policy_storage = DerivedStorageManager(policy_run_dir, POLICY_RECORDS_SPEC.task_name)
-        policy_keys = policy_storage.list_existing_keys()
-        policy_count = len(policy_keys)
-        if policy_count == 0:
-            print(
-                "  No policy records found. Run 'generate_policy_records' first:\n"
-                f"    python policy_records_main.py --run-id {args.policy_run_id}"
-                + (f" --output-dir {args.policy_run_dir}" if args.policy_run_dir else ""),
-                file=sys.stderr,
-            )
-
-        print(f"  Found {policy_count} policy records")
-
-        domain_counts = Counter(p.domain_slug for p in all_payloads)
-        bloom_counts = Counter(p.bloom_level for p in all_payloads)
-        sample_payloads = all_payloads[:5]
-        sample_policies = []
-        for key in policy_keys[:3]:
-            data = policy_storage.read_item(key)
-            if data:
-                sample_policies.append(data)
-
-        total_pairs = len(all_payloads) * policy_count if policy_count > 0 else 0
+        all_keys = storage.list_existing_keys()
+        generated_requested = len(requested_item_keys.intersection(all_keys))
+        export_path = storage.export_path()
+        export_lines = _rebuild_policy_text_export_view(storage)
         finished_at = utc_now_iso()
-        preflight = {
-            "task_family": HELP_GATE_PREFLIGHT_SPEC.task_family,
-            "run_scope": task_run_scope(HELP_GATE_TASK_FAMILY),
-            "phase": "preflight",
-            "run_id": args.run_id,
-            "qa_run_id": args.qa_run_id,
-            "policy_run_id": args.policy_run_id,
-            "generated_at": finished_at,
-            "payloads": {
-                "total": len(all_payloads),
-                "domain_distribution": dict(domain_counts.most_common()),
-                "bloom_distribution": dict(bloom_counts.most_common()),
-                "sample": [
-                    {
-                        "payload_id": p.payload_id,
-                        "domain_slug": p.domain_slug,
-                        "bloom_level": p.bloom_level,
-                        "request_preview": p.request_text[:80],
-                    }
-                    for p in sample_payloads
-                ],
-            },
-            "policy_records": {
-                "total": policy_count,
-                "sample": sample_policies[:3],
-            },
-            "composition": {
-                "estimated_pairs": total_pairs,
-                "status": "ready" if policy_count > 0 and len(all_payloads) > 0 else "blocked",
-                "warnings": _compute_preflight_warnings(all_payloads, policy_count),
-            },
-        }
-
-        preflight_path = context.storage.write_json("artifacts/preflight/composition_preflight.json", preflight)
         result_holder.update({
-            "preflight_path": preflight_path,
-            "payload_count": len(all_payloads),
-            "domain_count": len(domain_counts),
-            "policy_count": policy_count,
-            "total_pairs": total_pairs,
-            "status": preflight["composition"]["status"],
-            "warnings": preflight["composition"]["warnings"],
+            "all_keys": all_keys,
+            "export_path": export_path,
+            "export_lines": export_lines,
+            "source_total": len(source_keys),
         })
         return DerivedTaskResult(
             summary={
-                "phase": "preflight",
-                "qa_run_id": args.qa_run_id,
-                "policy_run_id": args.policy_run_id,
-                "payload_count": len(all_payloads),
-                "policy_count": policy_count,
-                "estimated_pairs": total_pairs,
-                "preflight_status": preflight["composition"]["status"],
-                "warnings": preflight["composition"]["warnings"],
+                "phase": "text_realization",
+                "source_policy_run_id": args.policy_run_id,
+                "language": args.language,
+                "requested": len(source_keys),
+                "generated": generated_requested,
+                "failed_items": failed_items,
+                "export_lines": export_lines,
+                "model": args.model,
+                "temperature": args.temperature,
+                "seed": args.seed,
                 "generated_at": finished_at,
             },
             run_state=DerivedRunState(
-                task_name=HELP_GATE_PREFLIGHT_SPEC.task_name,
-                run_id=args.run_id,
-                total_items=1,
-                completed_count=1,
-                failed_count=0,
+                total_items=len(source_keys),
+                completed_count=generated_requested,
+                failed_count=failed_items,
                 started_at=started_at,
                 updated_at=finished_at,
-                last_cursor="preflight",
             ),
+            status="completed_with_failures" if failed_items else "completed",
         )
 
     def on_error(context, exc: Exception) -> DerivedTaskResult:
         failed_at = utc_now_iso()
+        all_keys = storage.list_existing_keys()
+        generated_requested = len(requested_item_keys.intersection(all_keys))
+        failure_events = storage.count_failure_events()
+        started_at = existing_state.started_at if existing_state and existing_state.started_at else context.created_at
         return DerivedTaskResult(
             status="failed",
             summary={
-                "phase": "preflight",
-                "qa_run_id": args.qa_run_id,
-                "policy_run_id": args.policy_run_id,
+                "phase": "text_realization",
+                "source_policy_run_id": args.policy_run_id,
+                "language": args.language,
+                "requested": len(source_keys),
+                "generated": generated_requested,
+                "model": args.model,
+                "seed": args.seed,
                 "failed_at": failed_at,
                 "error": str(exc),
             },
             run_state=DerivedRunState(
-                task_name=HELP_GATE_PREFLIGHT_SPEC.task_name,
-                run_id=args.run_id,
-                total_items=1,
-                completed_count=0,
-                failed_count=1,
-                started_at=context.created_at,
+                total_items=len(source_keys),
+                completed_count=generated_requested,
+                failed_count=failure_events if failure_events else 1,
+                started_at=started_at,
                 updated_at=failed_at,
-                last_cursor="",
             ),
         )
 
     run_derived_task(
-        spec=HELP_GATE_PREFLIGHT_SPEC,
+        spec=POLICY_TEXT_RECORDS_SPEC,
         run_id=args.run_id,
         output_dir=args.output_dir,
         language=args.language,
@@ -547,23 +655,12 @@ def run_help_gate_preflight(args: argparse.Namespace) -> None:
         on_error=on_error,
     )
 
-    print(f"\nComposition preflight written to {result_holder['preflight_path']}")
-    print(f"  Payloads:   {result_holder['payload_count']} ({result_holder['domain_count']} domains)")
-    print(f"  Policies:   {result_holder['policy_count']}")
-    print(f"  Est. pairs: {result_holder['total_pairs']:,}")
-    print(f"  Status:     {result_holder['status']}")
-    for warning in result_holder["warnings"]:
-        print(f"  Warning:    {warning}")
-
-
-def _compute_preflight_warnings(payloads: list, policy_count: int) -> list[str]:
-    warnings: list[str] = []
-    if not payloads:
-        warnings.append("No payload records found — check the QA export view.")
-    if policy_count == 0:
-        warnings.append("No policy records found — run generate_policy_records first.")
-    if policy_count > 0 and len(payloads) > 0:
-        blooms = {p.bloom_level for p in payloads if p.bloom_level}
-        if len(blooms) < 3:
-            warnings.append(f"Only {len(blooms)} bloom levels represented across payloads.")
-    return warnings
+    all_keys = result_holder["all_keys"]
+    export_path = result_holder["export_path"]
+    export_lines = result_holder["export_lines"]
+    print(
+        f"Done — {len(all_keys)} policy text records in {storage.base}\n"
+        f"  export: {export_path} ({export_lines} lines)\n"
+        f"  items:  {storage.items_dir()} ({len(all_keys)} files)\n"
+        f"  state:  {storage.run_state_path()}"
+    )

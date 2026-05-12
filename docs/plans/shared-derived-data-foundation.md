@@ -145,7 +145,7 @@ output/
   zh/
     runs/
       qa_corpus--qa-1/
-      help_gate_augment--hg-1/
+      help_gate_acml--hg-1/
 ```
 
 Each run root should use the same broad categories:

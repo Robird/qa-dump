@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from relation_catalog import POLICY_RELATION_PROFILES
+
 
 # ---------------------------------------------------------------------------
 # Value enumerations (as module-level lists — not Enums — for sampling ease)
@@ -165,23 +167,7 @@ DECISION_STRATEGY_MAP: dict[str, list[str]] = {
 
 # Valid relation labels with direction and closeness hints
 # (label, direction, typical_closeness)
-RELATION_PROFILES: list[dict] = [
-    {"label": "导师", "direction": "target_is_my_relation", "typical_closeness": "medium"},
-    {"label": "学生", "direction": "i_am_targets_relation", "typical_closeness": "medium"},
-    {"label": "同事", "direction": "equal", "typical_closeness": "medium"},
-    {"label": "上司", "direction": "target_is_my_relation", "typical_closeness": "low"},
-    {"label": "下属", "direction": "i_am_targets_relation", "typical_closeness": "low"},
-    {"label": "家人", "direction": "target_is_my_relation", "typical_closeness": "high"},
-    {"label": "老朋友", "direction": "equal", "typical_closeness": "high"},
-    {"label": "陌生人", "direction": "target_is_my_relation", "typical_closeness": "low"},
-    {"label": "客户", "direction": "target_is_my_relation", "typical_closeness": "low"},
-    {"label": "合作伙伴", "direction": "equal", "typical_closeness": "medium"},
-    {"label": "邻居", "direction": "equal", "typical_closeness": "low"},
-    {"label": "同学", "direction": "equal", "typical_closeness": "medium"},
-    {"label": "老师", "direction": "target_is_my_relation", "typical_closeness": "medium"},
-    {"label": "晚辈", "direction": "i_am_targets_relation", "typical_closeness": "medium"},
-    {"label": "长辈", "direction": "target_is_my_relation", "typical_closeness": "high"},
-]
+RELATION_PROFILES: list[dict] = [profile.copy() for profile in POLICY_RELATION_PROFILES]
 
 
 # ---------------------------------------------------------------------------

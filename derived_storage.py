@@ -35,15 +35,11 @@ def _restore_key(name: str) -> str:
 class DerivedRunState(BaseModel):
     """Compact run metadata.  Does NOT store completed_keys or failed_keys —
     the filesystem is the completion ledger."""
-    task_name: str = ""
-    run_id: str = ""
-    source_run_id: str = ""
     total_items: int = 0
     completed_count: int = 0
     failed_count: int = 0
     started_at: str = ""
     updated_at: str = ""
-    last_cursor: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +150,13 @@ class DerivedStorageManager:
 
     def append_failure(self, event: dict) -> None:
         append_jsonl(self._failures_path(), event)
+
+    def count_failure_events(self) -> int:
+        path = self._failures_path()
+        if not path.exists():
+            return 0
+        with path.open("r", encoding="utf-8") as handle:
+            return sum(1 for line in handle if line.strip())
 
     # -- Run state (compact, no per-item sets) --
 
