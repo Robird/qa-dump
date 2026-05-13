@@ -263,6 +263,17 @@ def _load_all_help_gate_items(storage: DerivedStorageManager) -> tuple[HelpGateA
     return tuple(HelpGateACMLItem(**raw) for raw in storage.iter_items())
 
 
+def _list_existing_acml_sample_ids(run_dir: Path) -> set[str]:
+    """Scan artifacts/samples/**/*.acml and extract sample IDs from filenames."""
+    samples_dir = run_dir / "artifacts" / "samples"
+    if not samples_dir.is_dir():
+        return set()
+    ids: set[str] = set()
+    for acml_path in samples_dir.rglob("*.acml"):
+        ids.add(acml_path.stem)
+    return ids
+
+
 def _generate_samples(
     *,
     context,
@@ -273,6 +284,7 @@ def _generate_samples(
     failed_items = 0
     skipped_existing = 0
     completed_keys = set(existing_keys)
+    collected_items: list[HelpGateACMLItem] = []
     request = plan.request
     for pairing in plan.iter_pairs():
         sample_id = make_sample_id(
@@ -332,7 +344,7 @@ def _generate_samples(
                 reply_tool_name=composition.reply_tool_name,
                 belief_runtime_affordance_variant_id=composition.belief_runtime_affordance_variant_id,
             )
-            storage.write_item(sample_id, item.model_dump())
+            collected_items.append(item)
             completed_keys.add(sample_id)
         except Exception as exc:
             failed_items += 1
@@ -349,12 +361,11 @@ def _generate_samples(
             )
             logger.warning("ACML composition failed for %s: %s", sample_id, exc)
 
-    all_items = _load_all_help_gate_items(storage)
     return HelpGateGenerationOutcome(
-        generated=len(all_items),
+        generated=len(collected_items),
         failed_items=failed_items,
         skipped_existing=skipped_existing,
-        all_items=all_items,
+        all_items=tuple(collected_items),
     )
 
 
@@ -522,7 +533,7 @@ def run_help_gate_acml(args: argparse.Namespace) -> dict[str, object]:
     storage = DerivedStorageManager(run_dir, HELP_GATE_ACML_SPEC.task_name)
     storage.setup()
     existing_state = storage.load_run_state() if args.resume else None
-    existing_keys = set(storage.list_existing_keys())
+    existing_keys = _list_existing_acml_sample_ids(run_dir)
     config_doc = _help_gate_config_doc(request=request)
 
     def execute(context) -> DerivedTaskResult:
