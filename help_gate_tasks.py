@@ -310,7 +310,8 @@ def _generate_samples(
             )
             if issues:
                 raise ValueError("; ".join(issues))
-            sample_path = context.run_dir / "artifacts" / "samples" / f"{sample_id}.acml"
+            bloom_dir = pairing.payload.bloom_level or "_unlabeled"
+            sample_path = context.run_dir / "artifacts" / "samples" / bloom_dir / f"{sample_id}.acml"
             atomic_write_text(sample_path, rendered.text)
             item = HelpGateACMLItem(
                 sample_id=sample_id,
@@ -393,6 +394,7 @@ def _summary_fields_for_generation(
     will_help_counter = Counter("true" if item.will_help_now else "false" for item in generation.all_items)
     response_counter = Counter(item.response_intent for item in generation.all_items)
     domain_counter = Counter(item.domain_slug for item in generation.all_items)
+    bloom_counter = Counter(item.bloom_level or "_unlabeled" for item in generation.all_items)
     reply_tool_counter = Counter(item.reply_tool_name for item in generation.all_items)
     belief_affordance_counter = Counter(
         item.belief_runtime_affordance_variant_id for item in generation.all_items
@@ -415,6 +417,7 @@ def _summary_fields_for_generation(
         "will_help_now_distribution": dict(will_help_counter),
         "response_intent_distribution": dict(response_counter),
         "domain_distribution": dict(domain_counter),
+        "bloom_distribution": dict(bloom_counter),
         "reply_tool_name_distribution": dict(reply_tool_counter),
         "belief_runtime_affordance_distribution": dict(belief_affordance_counter),
         "generated_at": generated_at,
@@ -475,6 +478,12 @@ def _print_help_gate_report(
         print(f"  domain distribution ({len(dd)} domains):")
         for domain, cnt in sorted(dd.items(), key=lambda x: -x[1]):
             print(f"    {domain:<30} {cnt:>6}")
+
+    bd = summary.get("bloom_distribution", {})
+    if bd:
+        print(f"  bloom distribution ({len(bd)} levels):")
+        for level, cnt in sorted(bd.items(), key=lambda x: -x[1]):
+            print(f"    {level:<30} {cnt:>6}")
 
     rt = summary.get("reply_tool_name_distribution", {})
     if rt:
