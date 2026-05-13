@@ -454,6 +454,38 @@ def _print_help_gate_report(
     if summary["failed_items"]:
         print(f"  failures: {failures_path} ({summary['failed_items']} items)")
 
+    # --- Diagnostic distributions ---
+    wh = summary.get("will_help_now_distribution", {})
+    wh_total = sum(wh.values())
+    if wh_total:
+        wh_true = wh.get("true", 0)
+        print(f"\n  will_help_now: True={wh_true} ({100*wh_true/wh_total:.0f}%)  "
+              f"False={wh.get('false', 0)} ({100*wh.get('false',0)/wh_total:.0f}%)")
+
+    ri = summary.get("response_intent_distribution", {})
+    if ri:
+        print(f"  response_intent distribution ({sum(ri.values())} samples):")
+        for intent, cnt in sorted(ri.items(), key=lambda x: -x[1]):
+            pct = 100 * cnt / sum(ri.values())
+            bar = "█" * max(1, int(pct))
+            print(f"    {intent:<22} {cnt:>6} ({pct:>5.1f}%) {bar}")
+
+    dd = summary.get("domain_distribution", {})
+    if dd and len(dd) > 1:
+        print(f"  domain distribution ({len(dd)} domains):")
+        for domain, cnt in sorted(dd.items(), key=lambda x: -x[1]):
+            print(f"    {domain:<30} {cnt:>6}")
+
+    rt = summary.get("reply_tool_name_distribution", {})
+    if rt:
+        names = ", ".join(f"{k}={v}" for k, v in sorted(rt.items()))
+        print(f"  reply_tool: {names}")
+
+    ba = summary.get("belief_runtime_affordance_distribution", {})
+    if ba:
+        variants = ", ".join(f"{k}={v}" for k, v in sorted(ba.items()))
+        print(f"  affordance_variant: {variants}")
+
 
 def run_help_gate_acml(args: argparse.Namespace) -> dict[str, object]:
     request = _help_gate_request_from_args(args)

@@ -373,9 +373,12 @@ class PolicyGenerator:
         self,
         seed: int = 42,
         profile: PolicySamplerProfile = DEFAULT_PROFILE,
+        *,
+        decision_weights: dict[str, float] | None = None,
     ):
         self.seed = seed
         self.profile = profile
+        self.decision_weights = decision_weights or {}
         self._rng = None  # lazily initialized
 
     @property
@@ -388,19 +391,64 @@ class PolicyGenerator:
     # -- Quota allocation --
 
     def _build_decision_quotas(self, count: int) -> dict[str, int]:
-        """Allocate count across decisions, ensuring each gets at least 1."""
+        """Allocate count across decisions, respecting optional weights.
+
+        Each decision's floor is scaled by its weight (default 1.0).
+        A weight of 3.0 for ``engage_now`` means it receives 3× the
+        baseline floor, roughly tripling its share of the generated corpus.
+
+        When weighted floors sum beyond *count*, non-weighted decisions are
+        scaled down proportionally so the total never exceeds *count*.
+        """
         n_decisions = len(DECISION_VALUES)
-        floor = max(1, count // (n_decisions * 2))  # at least ~half of equal share
-        quotas: dict[str, int] = {d: floor for d in DECISION_VALUES}
+        base_floor = max(1, count // (n_decisions * 2))
+        quotas: dict[str, int] = {}
+        for d in DECISION_VALUES:
+            w = self.decision_weights.get(d, 1.0)
+            quotas[d] = max(1, int(base_floor * w))
 
         remaining = count - sum(quotas.values())
-        # Distribute remaining across decisions
-        while remaining > 0:
+        if remaining > 0:
+            # Distribute surplus across decisions, weighted by their multipliers
+            total_weight = sum(self.decision_weights.get(d, 1.0) for d in DECISION_VALUES)
+            weighted_remainder: dict[str, float] = {}
             for d in DECISION_VALUES:
-                if remaining <= 0:
-                    break
-                quotas[d] += 1
-                remaining -= 1
+                w = self.decision_weights.get(d, 1.0)
+                weighted_remainder[d] = remaining * (w / total_weight)
+            allocated = 0
+            for d in DECISION_VALUES:
+                quotas[d] += int(weighted_remainder[d])
+                allocated += int(weighted_remainder[d])
+            leftover = remaining - allocated
+            ordered = sorted(DECISION_VALUES, key=lambda d: self.decision_weights.get(d, 1.0), reverse=True)
+            for i in range(leftover):
+                quotas[ordered[i % len(ordered)]] += 1
+        elif remaining < 0:
+            # Over-allocated: scale down non-weighted decisions proportionally.
+            # Never shrink engage_now below its weighted floor.
+            shortfall = -remaining
+            other_decisions = [d for d in DECISION_VALUES if self.decision_weights.get(d, 1.0) <= 1.0]
+            if other_decisions:
+                other_total = sum(quotas[d] for d in other_decisions)
+                if other_total > 0:
+                    # Proportional reduction across other decisions, preserving at least 1 each
+                    reduced = 0
+                    for d in other_decisions:
+                        if reduced >= shortfall:
+                            break
+                        share = int(shortfall * (quotas[d] / other_total))
+                        share = min(share, quotas[d] - 1)  # keep at least 1
+                        quotas[d] -= share
+                        reduced += share
+                    # If still short, take 1 from largest remaining others
+                    remaining_shortfall = shortfall - reduced
+                    others_by_size = sorted(other_decisions, key=lambda d: quotas[d], reverse=True)
+                    for d in others_by_size:
+                        if remaining_shortfall <= 0:
+                            break
+                        if quotas[d] > 1:
+                            quotas[d] -= 1
+                            remaining_shortfall -= 1
 
         return quotas
 

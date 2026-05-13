@@ -154,6 +154,14 @@ def _validate_policy_resume_config(run_dir: Path, args: argparse.Namespace) -> N
             file=sys.stderr,
         )
         sys.exit(1)
+    existing_will_help_weight = existing_config.get("will_help_weight")
+    if existing_will_help_weight is not None and existing_will_help_weight != args.will_help_weight:
+        print(
+            f"Resume will_help_weight mismatch for {run_dir}: "
+            f"existing={existing_will_help_weight}, requested={args.will_help_weight}.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def configure_logging(verbose: bool) -> None:
@@ -226,6 +234,16 @@ def build_policy_records_parser() -> argparse.ArgumentParser:
         "--resume",
         action="store_true",
         help="Resume by skipping already-completed items",
+    )
+    parser.add_argument(
+        "--will-help-weight",
+        type=float,
+        default=9.0,
+        help=(
+            "Relative weight for engage_now (will_help_now=True) decisions. "
+            "1.0 = uniform (≈14%%); 3.0 ≈ 26%%; 5.0 ≈ 38%%. "
+            "Other decisions keep weight 1.0."
+        ),
     )
     parser.add_argument(
         "--verbose",
@@ -355,6 +373,8 @@ def _realize_one_policy_text(
             "success": False,
             "judge_rejections": 0,
             "error": error_msg,
+            "policy_decision": "?",
+            "will_help_now": None,
         }
 
     source_policy = validate_policy_record(raw, expected_record_id=source_key)
@@ -381,6 +401,8 @@ def _realize_one_policy_text(
             "success": False,
             "judge_rejections": 0,
             "error": error_msg,
+            "policy_decision": raw.get("policy", {}).get("decision", "?"),
+            "will_help_now": raw.get("policy", {}).get("decision") == "engage_now",
         }
 
     # Each worker owns its own LLM runtime so httpx.Client stays single-thread.
@@ -418,6 +440,8 @@ def _realize_one_policy_text(
             "success": False,
             "judge_rejections": outcome.judge_rejections,
             "error": str(outcome.last_error),
+            "policy_decision": source_policy.policy.decision,
+            "will_help_now": task.intent_spec.will_help_now,
         }
 
     if outcome.realization is None:
@@ -443,6 +467,8 @@ def _realize_one_policy_text(
             "success": False,
             "judge_rejections": outcome.judge_rejections,
             "error": error_msg,
+            "policy_decision": source_policy.policy.decision,
+            "will_help_now": task.intent_spec.will_help_now,
         }
 
     record = build_policy_text_record(task, outcome.realization)
@@ -454,6 +480,8 @@ def _realize_one_policy_text(
         "success": True,
         "judge_rejections": outcome.judge_rejections,
         "error": None,
+        "policy_decision": source_policy.policy.decision,
+        "will_help_now": task.intent_spec.will_help_now,
     }
 
 
@@ -473,12 +501,16 @@ def run_generate_policy_records(args: argparse.Namespace) -> None:
         _validate_policy_resume_config(run_dir, args)
 
     existing_state = storage.load_run_state() if args.resume else None
+    decision_weights = {}
+    if args.will_help_weight != 1.0:
+        decision_weights["engage_now"] = args.will_help_weight
     config_doc = {
         "task": "generate_policy_records",
         "run_id": args.run_id,
         "count_requested": args.count,
         "seed": args.seed,
         "sampler_profile": DEFAULT_PROFILE.name,
+        "will_help_weight": args.will_help_weight,
     }
     lineage_doc = {"sources": []}
     result_holder: dict[str, object] = {}
@@ -495,9 +527,14 @@ def run_generate_policy_records(args: argparse.Namespace) -> None:
             missing_requested = len(requested_keys - existing_keys)
             print(
                 f"Generating policy records up to {args.count} total "
-                f"(seed={args.seed}, missing={missing_requested}) ..."
+                f"(seed={args.seed}, missing={missing_requested}, "
+                f"will_help_weight={args.will_help_weight}) ..."
             )
-            generator = PolicyGenerator(seed=args.seed, profile=DEFAULT_PROFILE)
+            generator = PolicyGenerator(
+                seed=args.seed,
+                profile=DEFAULT_PROFILE,
+                decision_weights=decision_weights,
+            )
             generated_records = generator.generate(count=args.count)
             written_count = _write_policy_records(storage, generated_records, existing_keys)
             logger.info(
@@ -524,6 +561,7 @@ def run_generate_policy_records(args: argparse.Namespace) -> None:
                 "export_lines": export_lines,
                 "seed": args.seed,
                 "sampler_profile": DEFAULT_PROFILE.name,
+                "will_help_weight": args.will_help_weight,
                 "generator_version": POLICY_GENERATOR_VERSION,
                 "generated_at": finished_at,
             },
@@ -574,12 +612,44 @@ def run_generate_policy_records(args: argparse.Namespace) -> None:
     all_keys = result_holder["all_keys"]
     export_path = result_holder["export_path"]
     export_lines = result_holder["export_lines"]
+
+    # --- Per-decision breakdown (read-only, no lock needed post-generation) ---
+    decision_counter: dict[str, int] = {}
+    for k in all_keys:
+        raw = storage.read_item(k)
+        if raw is None:
+            continue
+        decision = raw.get("policy", {}).get("decision", "?")
+        decision_counter[decision] = decision_counter.get(decision, 0) + 1
+    engage_count = decision_counter.get("engage_now", 0)
+    engage_pct = 100 * engage_count / len(all_keys) if all_keys else 0
+
     print(
         f"Done — {len(all_keys)} policy records in {storage.base}\n"
         f"  export: {export_path} ({export_lines} lines)\n"
         f"  items:  {storage.items_dir()} ({len(all_keys)} files)\n"
         f"  state:  {storage.run_state_path()}"
     )
+    print(f"  Decision distribution ({len(all_keys)} total):")
+    # Print in canonical order: positive first, then neutral, then negative
+    _canonical_decision_order = [
+        "engage_now", "engage_briefly",
+        "defer", "redirect_channel_or_time",
+        "decline", "set_boundary", "minimal_acknowledgment",
+    ]
+    for d in _canonical_decision_order:
+        c = decision_counter.get(d, 0)
+        if c:
+            pct = 100 * c / len(all_keys)
+            will = "✓ will_help" if d == "engage_now" else "✗ won't help"
+            bar = "█" * max(1, int(pct))
+            print(f"    {d:<28} {c:>5} ({pct:>5.1f}%) {bar} {will}")
+    for d in sorted(decision_counter):
+        if d not in _canonical_decision_order:
+            c = decision_counter[d]
+            pct = 100 * c / len(all_keys)
+            print(f"    {d:<28} {c:>5} ({pct:>5.1f}%)")
+    print(f"    will_help_now=True:  {engage_count}/{len(all_keys)} ({engage_pct:.0f}%)")
 
 
 def _validate_policy_text_resume_config(run_dir: Path, args: argparse.Namespace) -> None:
@@ -717,6 +787,10 @@ def run_generate_policy_text_records(args: argparse.Namespace) -> None:
                 )
                 failure_lock = threading.Lock()
                 completed_count = 0
+                # Per-worker stats: each worker returns its own decision info,
+                # controller aggregates without contention.
+                decision_counter: dict[str, int] = {}
+                will_help_counter: dict[str, int] = {"true": 0, "false": 0}
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = {
                         executor.submit(
@@ -737,7 +811,7 @@ def run_generate_policy_text_records(args: argparse.Namespace) -> None:
                     for future in as_completed(futures):
                         source_key = futures[future]
                         try:
-                            outcome = future.result()
+                            worker_outcome = future.result()
                         except Exception as exc:
                             failed_items += 1
                             item_key = make_policy_text_record_id(source_key)
@@ -759,8 +833,16 @@ def run_generate_policy_text_records(args: argparse.Namespace) -> None:
                                 exc,
                             )
                         else:
-                            judge_rejections += outcome["judge_rejections"]
-                            if not outcome["success"]:
+                            judge_rejections += worker_outcome.get("judge_rejections", 0)
+                            # Per-worker diagnostic stats — no lock needed
+                            dec = worker_outcome.get("policy_decision", "?")
+                            decision_counter[dec] = decision_counter.get(dec, 0) + 1
+                            wh = worker_outcome.get("will_help_now", None)
+                            if wh is True:
+                                will_help_counter["true"] += 1
+                            elif wh is False:
+                                will_help_counter["false"] += 1
+                            if not worker_outcome.get("success"):
                                 failed_items += 1
                             completed_count += 1
                             if completed_count % 10 == 0 or completed_count == total_pending:
@@ -779,6 +861,8 @@ def run_generate_policy_text_records(args: argparse.Namespace) -> None:
             "export_path": export_path,
             "export_lines": export_lines,
             "source_total": len(source_keys),
+            "decision_counter": decision_counter,
+            "will_help_counter": will_help_counter,
         })
         return DerivedTaskResult(
             summary={
@@ -795,6 +879,8 @@ def run_generate_policy_text_records(args: argparse.Namespace) -> None:
                 "judge_rejections": judge_rejections,
                 "max_attempts": args.max_attempts,
                 "generated_at": finished_at,
+                "will_help_now_distribution": dict(will_help_counter),
+                "decision_distribution": dict(decision_counter),
             },
             run_state=DerivedRunState(
                 total_items=len(source_keys),
@@ -849,9 +935,30 @@ def run_generate_policy_text_records(args: argparse.Namespace) -> None:
     all_keys = result_holder["all_keys"]
     export_path = result_holder["export_path"]
     export_lines = result_holder["export_lines"]
+    decision_counter: dict[str, int] = result_holder.get("decision_counter", {})
+    will_help_counter: dict[str, int] = result_holder.get("will_help_counter", {})
+    total_processed = sum(decision_counter.values())
     print(
         f"Done — {len(all_keys)} policy text records in {storage.base}\n"
         f"  export: {export_path} ({export_lines} lines)\n"
         f"  items:  {storage.items_dir()} ({len(all_keys)} files)\n"
         f"  state:  {storage.run_state_path()}"
     )
+    if total_processed:
+        print(f"  Decision distribution ({total_processed} processed):")
+        _canonical_decision_order = [
+            "engage_now", "engage_briefly",
+            "defer", "redirect_channel_or_time",
+            "decline", "set_boundary", "minimal_acknowledgment",
+        ]
+        for d in _canonical_decision_order:
+            c = decision_counter.get(d, 0)
+            if c:
+                pct = 100 * c / total_processed
+                will = "✓ will_help" if d == "engage_now" else "✗ won't help"
+                bar = "█" * max(1, int(pct))
+                print(f"    {d:<28} {c:>5} ({pct:>5.1f}%) {bar} {will}")
+        wht = will_help_counter.get("true", 0)
+        whf = will_help_counter.get("false", 0)
+        print(f"    will_help_now=True:  {wht}/{total_processed} ({100*wht/total_processed:.0f}%)")
+        print(f"    will_help_now=False: {whf}/{total_processed} ({100*whf/total_processed:.0f}%)")
