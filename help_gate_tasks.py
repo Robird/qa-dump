@@ -11,6 +11,7 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+import acml_shard
 from derived_lifecycle import DerivedTaskResult, run_derived_task
 from derived_specs import HELP_GATE_ACML_SPEC
 from derived_storage import DerivedRunState, DerivedStorageManager
@@ -286,6 +287,16 @@ def _generate_samples(
     completed_keys = set(existing_keys)
     collected_items: list[HelpGateACMLItem] = []
     request = plan.request
+
+    # Per-bloom_level shard writers (created lazily on first use).
+    shard_base = context.run_dir / "artifacts" / "shards"
+    shard_writers: dict[str, acml_shard.AcmlShardWriter] = {}
+
+    def _shard_for(bloom: str) -> acml_shard.AcmlShardWriter:
+        if bloom not in shard_writers:
+            shard_writers[bloom] = acml_shard.AcmlShardWriter(shard_base, bloom_level=bloom)
+        return shard_writers[bloom]
+
     for pairing in plan.iter_pairs():
         sample_id = make_sample_id(
             qa_run_id=request.qa_run_id,
@@ -346,6 +357,11 @@ def _generate_samples(
             )
             collected_items.append(item)
             completed_keys.add(sample_id)
+
+            # Also append to the bloom-level shard (bulk-friendly sequential I/O).
+            shard_record = item.model_dump()
+            shard_record["text"] = rendered.text
+            _shard_for(bloom_dir).append(shard_record)
         except Exception as exc:
             failed_items += 1
             storage.append_failure(
@@ -360,6 +376,10 @@ def _generate_samples(
                 }
             )
             logger.warning("ACML composition failed for %s: %s", sample_id, exc)
+
+    # Close all shard writers.
+    for w in shard_writers.values():
+        w.close()
 
     return HelpGateGenerationOutcome(
         generated=len(collected_items),
