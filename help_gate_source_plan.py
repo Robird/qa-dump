@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,7 +25,24 @@ from task_contracts import (
 )
 
 
-HELP_GATE_PAIRING_STRATEGY = "qa_anchor_modulo_policy_text"
+HELP_GATE_PAIRING_STRATEGY = "qa_anchor_modulo_policy_text_shuffled"
+
+
+def interleave_payloads(
+    payloads: list[PayloadRecord],
+    *,
+    seed: int = 42,
+) -> list[PayloadRecord]:
+    """Deterministic shuffle so ``max_samples`` slices are domain-diverse.
+
+    Uses a fixed seed so the same input always produces the same order.
+    This keeps smoke tests reproducible while preventing the
+    alphabetically-first domain from eating the entire budget at
+    small ``max_samples``.
+    """
+    result = list(payloads)
+    random.Random(seed).shuffle(result)
+    return result
 
 
 class HelpGateSourcePlanError(RuntimeError):
@@ -246,20 +264,26 @@ def build_help_gate_source_plan(
     policy_text_records: list[PolicyTextRecord],
 ) -> HelpGateSourcePlan:
     adapter = QAPayloadAdapter(str(qa_run.run_dir))
-    payloads = load_filtered_payloads(
+    # Load *all* matching payloads first, then interleave and slice.
+    # This guarantees domain-stratified coverage even when max_samples
+    # is smaller than the total pool.
+    raw_payloads = load_filtered_payloads(
         adapter,
         domains=list(request.domains) if request.domains else None,
         bloom_levels=list(request.bloom_levels) if request.bloom_levels else None,
-        max_records=request.max_samples,
+        max_records=None,  # shuffle first, slice later
     )
-    payloads.sort(key=lambda payload: payload.payload_id)
+    shuffled = interleave_payloads(raw_payloads)
+    if request.max_samples is not None:
+        shuffled = shuffled[: request.max_samples]
+
     policy_text_records = sorted(policy_text_records, key=lambda record: record.record_id)
     return HelpGateSourcePlan(
         request=request,
         qa_run=qa_run,
         policy_text_run=policy_text_run,
         qa_reader=qa_reader,
-        payloads=tuple(payloads),
+        payloads=tuple(shuffled),
         policy_text_records=tuple(policy_text_records),
     )
 
