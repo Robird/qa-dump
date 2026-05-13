@@ -15,7 +15,7 @@ import acml_shard
 from derived_lifecycle import DerivedTaskResult, run_derived_task
 from derived_specs import HELP_GATE_ACML_SPEC
 from derived_storage import DerivedRunState, DerivedStorageManager
-from fs_utils import atomic_write_text
+from fs_utils import write_jsonl
 from help_gate_acml import (
     HELP_GATE_ACML_COMPOSITION_VERSION,
     build_acml_composition,
@@ -31,7 +31,7 @@ from help_gate_source_plan import (
     resolve_help_gate_source_plan,
 )
 from policy_text_contracts import LANGUAGE_VALUES, PolicyDecisionName, RelationKind, ResponseIntent
-from run_metadata import load_config_doc, utc_now_iso
+from run_metadata import utc_now_iso
 from task_contracts import HELP_GATE_TASK_FAMILY, QA_VIEW_ID, task_run_scope
 
 logger = logging.getLogger(__name__)
@@ -61,7 +61,6 @@ class HelpGateACMLItem(BaseModel):
 class HelpGateGenerationOutcome:
     generated: int
     failed_items: int
-    skipped_existing: int
     all_items: tuple[HelpGateACMLItem, ...]
 
 
@@ -76,11 +75,6 @@ def add_help_gate_acml_arguments(parser: argparse.ArgumentParser) -> None:
         "--output-dir",
         default=None,
         help="Explicit output directory for the help-gate ACML run",
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume by skipping already-completed samples",
     )
     parser.add_argument(
         "--preflight-only",
@@ -170,35 +164,6 @@ def _help_gate_config_doc(
     }
 
 
-def _validate_help_gate_acml_resume_config(run_dir: Path, *, request: HelpGateSourceRequest) -> None:
-    existing_config = load_config_doc(run_dir)
-    if existing_config is None:
-        return
-    if existing_config.get("task") != "help_gate_acml":
-        print(
-            f"Cannot resume non-help-gate ACML run in {run_dir}: task={existing_config.get('task')!r}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    expected = request.config_fields()
-    expected = {
-        "composition_version": HELP_GATE_ACML_COMPOSITION_VERSION,
-        **expected,
-    }
-    mismatches = [
-        f"{key}={existing_config.get(key)!r} (requested {value!r})"
-        for key, value in expected.items()
-        if existing_config.get(key) != value
-    ]
-    if mismatches:
-        print(f"Resume config mismatch for {run_dir}: " + ", ".join(mismatches), file=sys.stderr)
-        sys.exit(1)
-
-
-def _help_gate_acml_has_existing_state(run_dir: Path) -> bool:
-    return load_config_doc(run_dir) is not None
-
-
 def _build_help_gate_preflight_report(
     *,
     run_id: str,
@@ -260,31 +225,12 @@ def _run_preflight(
     context.storage.write_json("artifacts/preflight/composition_preflight.json", preflight)
 
 
-def _load_all_help_gate_items(storage: DerivedStorageManager) -> tuple[HelpGateACMLItem, ...]:
-    return tuple(HelpGateACMLItem(**raw) for raw in storage.iter_items())
-
-
-def _list_existing_acml_sample_ids(run_dir: Path) -> set[str]:
-    """Scan artifacts/samples/**/*.acml and extract sample IDs from filenames."""
-    samples_dir = run_dir / "artifacts" / "samples"
-    if not samples_dir.is_dir():
-        return set()
-    ids: set[str] = set()
-    for acml_path in samples_dir.rglob("*.acml"):
-        ids.add(acml_path.stem)
-    return ids
-
-
 def _generate_samples(
     *,
     context,
-    storage: DerivedStorageManager,
     plan: HelpGateSourcePlan,
-    existing_keys: set[str],
 ) -> HelpGateGenerationOutcome:
     failed_items = 0
-    skipped_existing = 0
-    completed_keys = set(existing_keys)
     collected_items: list[HelpGateACMLItem] = []
     request = plan.request
 
@@ -306,9 +252,6 @@ def _generate_samples(
             policy_text_record_id=pairing.policy_text.record_id,
             language=request.language,
         )
-        if sample_id in completed_keys:
-            skipped_existing += 1
-            continue
         logger.info(
             "Composing ACML %s (%d/%d, qa=%s, policy_text=%s, will_help_now=%s)",
             sample_id,
@@ -334,8 +277,6 @@ def _generate_samples(
             if issues:
                 raise ValueError("; ".join(issues))
             bloom_dir = pairing.payload.bloom_level or "_unlabeled"
-            sample_path = context.run_dir / "artifacts" / "samples" / bloom_dir / f"{sample_id}.acml"
-            atomic_write_text(sample_path, rendered.text)
             item = HelpGateACMLItem(
                 sample_id=sample_id,
                 qa_record_id=pairing.payload.payload_id,
@@ -356,15 +297,14 @@ def _generate_samples(
                 belief_runtime_affordance_variant_id=composition.belief_runtime_affordance_variant_id,
             )
             collected_items.append(item)
-            completed_keys.add(sample_id)
 
-            # Also append to the bloom-level shard (bulk-friendly sequential I/O).
+            # Append to the bloom-level shard (bulk-friendly sequential I/O).
             shard_record = item.model_dump()
-            shard_record["text"] = rendered.text
+            shard_record["acml"] = rendered.text
             _shard_for(bloom_dir).append(shard_record)
         except Exception as exc:
             failed_items += 1
-            storage.append_failure(
+            context.storage.append_failure(
                 {
                     "task_name": HELP_GATE_ACML_SPEC.task_name,
                     "run_id": context.run_id,
@@ -381,10 +321,14 @@ def _generate_samples(
     for w in shard_writers.values():
         w.close()
 
+    # Write single-file export view from in-memory records.
+    if collected_items:
+        export_path = context.run_dir / "views" / "export.jsonl"
+        write_jsonl(export_path, [item.model_dump() for item in collected_items])
+
     return HelpGateGenerationOutcome(
         generated=len(collected_items),
         failed_items=failed_items,
-        skipped_existing=skipped_existing,
         all_items=tuple(collected_items),
     )
 
@@ -392,8 +336,6 @@ def _generate_samples(
 def _summary_fields_for_preflight(
     *,
     plan: HelpGateSourcePlan,
-    generated: int,
-    skipped_existing: int,
     generated_at: str,
 ) -> dict:
     return {
@@ -404,8 +346,7 @@ def _summary_fields_for_preflight(
         "estimated_samples": plan.estimated_samples,
         "generation_readiness": plan.generation_readiness,
         "warnings": plan.warnings(),
-        "generated": generated,
-        "skipped_existing": skipped_existing,
+        "generated": 0,
         "failed_items": 0,
         "composition_version": HELP_GATE_ACML_COMPOSITION_VERSION,
         "generated_at": generated_at,
@@ -439,7 +380,6 @@ def _summary_fields_for_generation(
         "requested": plan.estimated_samples,
         "generated": generation.generated,
         "failed_items": generation.failed_items,
-        "skipped_existing": generation.skipped_existing,
         "pairing_strategy": plan.pairing_strategy,
         "sample_id_policy": "sha256(lineage_tuple)[:20]",
         "composition_version": HELP_GATE_ACML_COMPOSITION_VERSION,
@@ -463,8 +403,8 @@ def _print_help_gate_report(
     preflight_only: bool,
 ) -> None:
     preflight_path = run_dir / "artifacts" / "preflight" / "composition_preflight.json"
-    sample_dir = run_dir / "artifacts" / "samples"
-    items_dir = run_dir / "artifacts" / "items"
+    shards_dir = run_dir / "artifacts" / "shards"
+    export_path = run_dir / "views" / "export.jsonl"
     failures_path = run_dir / "system" / "failures.jsonl"
     run_state_path = run_dir / "work" / "run_state.json"
 
@@ -480,10 +420,9 @@ def _print_help_gate_report(
 
     print(
         f"\nDone — {summary['generated']} ACML samples in {run_dir}\n"
-        f"  samples:  {sample_dir}\n"
-        f"  items:    {items_dir}\n"
-        f"  state:    {run_state_path}\n"
-        f"  skipped:  {summary['skipped_existing']}"
+        f"  shards:   {shards_dir}\n"
+        f"  export:   {export_path}\n"
+        f"  state:    {run_state_path}"
     )
     if summary["failed_items"]:
         print(f"  failures: {failures_path} ({summary['failed_items']} items)")
@@ -540,24 +479,10 @@ def run_help_gate_acml(args: argparse.Namespace) -> dict[str, object]:
         output_dir=args.output_dir,
         language=request.language,
     )
-    if _help_gate_acml_has_existing_state(run_dir) and not args.resume:
-        print(
-            f"Help-gate ACML run directory already exists: {run_dir}\n"
-            "Use --resume to continue this run, or choose a new --run-id / --output-dir.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    if args.resume:
-        _validate_help_gate_acml_resume_config(run_dir, request=request)
-
-    storage = DerivedStorageManager(run_dir, HELP_GATE_ACML_SPEC.task_name)
-    storage.setup()
-    existing_state = storage.load_run_state() if args.resume else None
-    existing_keys = _list_existing_acml_sample_ids(run_dir)
     config_doc = _help_gate_config_doc(request=request)
 
     def execute(context) -> DerivedTaskResult:
-        started_at = existing_state.started_at if existing_state and existing_state.started_at else context.created_at
+        started_at = context.created_at
         print(f"Loading payloads from {plan.qa_view_path} ...")
         _run_preflight(
             context=context,
@@ -578,7 +503,6 @@ def run_help_gate_acml(args: argparse.Namespace) -> dict[str, object]:
 
         if args.preflight_only or plan.generation_readiness != "ready":
             finished_at = utc_now_iso()
-            existing_generated = len(existing_keys)
             return DerivedTaskResult(
                 status="blocked" if plan.generation_readiness != "ready" else "completed",
                 summary={
@@ -587,14 +511,12 @@ def run_help_gate_acml(args: argparse.Namespace) -> dict[str, object]:
                     "pairing_strategy": plan.pairing_strategy,
                     **_summary_fields_for_preflight(
                         plan=plan,
-                        generated=existing_generated,
-                        skipped_existing=existing_generated,
                         generated_at=finished_at,
                     ),
                 },
                 run_state=DerivedRunState(
                     total_items=plan.estimated_samples,
-                    completed_count=existing_generated,
+                    completed_count=0,
                     failed_count=0,
                     started_at=started_at,
                     updated_at=finished_at,
@@ -603,9 +525,7 @@ def run_help_gate_acml(args: argparse.Namespace) -> dict[str, object]:
 
         generation = _generate_samples(
             context=context,
-            storage=storage,
             plan=plan,
-            existing_keys=existing_keys,
         )
         finished_at = utc_now_iso()
         return DerivedTaskResult(
@@ -630,9 +550,7 @@ def run_help_gate_acml(args: argparse.Namespace) -> dict[str, object]:
 
     def on_error(context, exc: Exception) -> DerivedTaskResult:
         failed_at = utc_now_iso()
-        all_items = _load_all_help_gate_items(storage)
-        failure_events = storage.count_failure_events()
-        started_at = existing_state.started_at if existing_state and existing_state.started_at else context.created_at
+        failure_events = context.storage.count_failure_events()
         return DerivedTaskResult(
             status="failed",
             summary={
@@ -641,7 +559,7 @@ def run_help_gate_acml(args: argparse.Namespace) -> dict[str, object]:
                 "policy_text_run_id": request.policy_text_run_id,
                 "composition_version": HELP_GATE_ACML_COMPOSITION_VERSION,
                 "requested": plan.estimated_samples,
-                "generated": len(all_items),
+                "generated": 0,
                 "failed_items": failure_events if failure_events else 1,
                 "failed_at": failed_at,
                 "error": str(exc),
@@ -649,9 +567,9 @@ def run_help_gate_acml(args: argparse.Namespace) -> dict[str, object]:
             },
             run_state=DerivedRunState(
                 total_items=plan.estimated_samples,
-                completed_count=len(all_items),
+                completed_count=0,
                 failed_count=failure_events if failure_events else 1,
-                started_at=started_at,
+                started_at=context.created_at,
                 updated_at=failed_at,
             ),
         )

@@ -37,8 +37,10 @@ HELP_GATE_ACML_SPEC = DerivedTaskSpec(
     outputs={
         "artifacts": {
             "preflight": {"path": "artifacts/preflight/composition_preflight.json"},
-            "items": {"path": "artifacts/items"},
-            "samples": {"path": "artifacts/samples"},
+            "shards": {"path": "artifacts/shards"},
+        },
+        "views": {
+            "export": {"path": "views/export.jsonl"},
         },
     },
 )

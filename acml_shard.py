@@ -80,7 +80,7 @@ class AcmlShardWriter:
 
         writer = AcmlShardWriter(Path("artifacts/shards"), bloom_level="analyze")
         for sample in samples:
-            writer.append({"sample_id": sample.id, "text": sample.text, ...})
+            writer.append({"sample_id": sample.id, "acml": sample.acml, ...})
         writer.close()
     """
 
