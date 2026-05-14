@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import re
 
@@ -223,6 +224,15 @@ def make_sample_counterparty_entity_id(sample_id: str, source_entity_id: str) ->
     source_entity_id = _require_text(source_entity_id, "source_entity_id")
     source_digest = hashlib.sha256(f"{sample_id}\x1f{source_entity_id}".encode("utf-8")).hexdigest()[:12]
     return f"{COUNTERPARTY_ENTITY_TYPE}__sample__{_stable_id_component(sample_id)}__{source_digest}__primary"
+
+
+def make_rendered_counterparty_entity_id(sample_id: str, source_entity_id: str) -> str:
+    sample_id = _require_text(sample_id, "sample_id")
+    source_entity_id = _require_text(source_entity_id, "source_entity_id")
+    digest = hashlib.sha256(
+        f"{sample_id}\x1f{source_entity_id}\x1frendered_entity_id".encode("utf-8")
+    ).digest()[:8]
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
 
 
 def validate_counterparty_identity(

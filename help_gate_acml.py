@@ -10,6 +10,7 @@ preserving the same underlying semantic labels.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 
 from acml import parse_document, serialize_document
@@ -23,7 +24,7 @@ from acml.semantic_model import (
     semantic_document_to_document,
 )
 
-from entity_catalog import make_sample_counterparty_entity_id
+from entity_catalog import make_rendered_counterparty_entity_id, make_sample_counterparty_entity_id
 from payload_adapter import PayloadRecord
 from policy_text_contracts import LanguageCode
 from policy_text_models import PolicyTextRecord
@@ -31,8 +32,9 @@ from relation_catalog import named_observation_wrapper_for
 
 
 HELP_GATE_ACML_TASK = "help_gate_acml_v1"
-HELP_GATE_ACML_COMPOSITION_VERSION = "1.7"
+HELP_GATE_ACML_COMPOSITION_VERSION = "1.8"
 REPLY_TOOL_DIALECT = "csharp-v0"
+BELIEF_ENTITY_REGISTRY_LABEL = "known_people_json:"
 # Training-data augmentation surface: vary lightweight runtime API naming while
 # keeping the signature stable. Downstream validation already guarantees the
 # chosen name stays sample-internal consistent, so do not collapse this pool to
@@ -78,10 +80,12 @@ class HelpGateACMLComposition:
     policy_text: PolicyTextRecord
     source_counterparty_entity_id: str
     sample_counterparty_entity_id: str
+    rendered_counterparty_entity_id: str
     counterparty_canonical_name: str
     counterparty_first_mention_name: str
     reply_tool_name: str
     belief_runtime_affordance_variant_id: str
+    belief_entity_registry_text: str
     belief_text: str
     observation_wrapper: str
     me_reasoning_text: str
@@ -180,6 +184,28 @@ def compose_reply_action_text(payload: PayloadRecord, policy_text: PolicyTextRec
     return payload.fulfillment_content.strip()
 
 
+def compose_belief_entity_registry_text(
+    *,
+    rendered_counterparty_entity_id: str,
+    relation_kind: str,
+    counterparty_canonical_name: str,
+    counterparty_first_mention_name: str,
+) -> str:
+    registry = [
+        {
+            "entity_id": rendered_counterparty_entity_id,
+            "entity_type": "person",
+            "relation": relation_kind,
+            "name": counterparty_canonical_name,
+            "mention": counterparty_first_mention_name,
+        }
+    ]
+    return (
+        f"{BELIEF_ENTITY_REGISTRY_LABEL}\n"
+        f"{json.dumps(registry, ensure_ascii=False, separators=(",", ":"))}\n\n"
+    )
+
+
 def reply_tool_prototype_text(
     language: LanguageCode,
     *,
@@ -228,6 +254,10 @@ def build_acml_composition(
         sample_id,
         source_counterparty_entity_id,
     )
+    rendered_counterparty_entity_id = make_rendered_counterparty_entity_id(
+        sample_id,
+        source_counterparty_entity_id,
+    )
     reply_tool_name = select_reply_tool_name(sample_id)
     belief_runtime_affordance_variant_id = select_belief_runtime_affordance_variant_id(
         sample_id,
@@ -241,10 +271,17 @@ def build_acml_composition(
         policy_text=policy_text,
         source_counterparty_entity_id=source_counterparty_entity_id,
         sample_counterparty_entity_id=sample_counterparty_entity_id,
+        rendered_counterparty_entity_id=rendered_counterparty_entity_id,
         counterparty_canonical_name=policy_text.counterparty_canonical_name,
         counterparty_first_mention_name=counterparty_first_mention_name,
         reply_tool_name=reply_tool_name,
         belief_runtime_affordance_variant_id=belief_runtime_affordance_variant_id,
+        belief_entity_registry_text=compose_belief_entity_registry_text(
+            rendered_counterparty_entity_id=rendered_counterparty_entity_id,
+            relation_kind=policy_text.relation_kind,
+            counterparty_canonical_name=policy_text.counterparty_canonical_name,
+            counterparty_first_mention_name=counterparty_first_mention_name,
+        ),
         belief_text=compose_belief_text(
             language,
             policy_text,
@@ -279,7 +316,7 @@ def build_acml_document(
                     SemanticText(
                         reply_action_prefix(
                             composition.reply_tool_name,
-                            composition.sample_counterparty_entity_id,
+                            composition.rendered_counterparty_entity_id,
                         )
                     ),
                     SemanticPayload(composition.reply_action_text),
@@ -288,7 +325,7 @@ def build_acml_document(
                 attrs=(
                     Attribute("tool", composition.reply_tool_name),
                     Attribute("dialect", REPLY_TOOL_DIALECT),
-                    Attribute("target_entity_id", composition.sample_counterparty_entity_id),
+                    Attribute("target_entity_id", composition.rendered_counterparty_entity_id),
                 ),
             )
         )
@@ -306,8 +343,7 @@ def build_acml_document(
                 attrs=(
                     Attribute("source", "qa"),
                     Attribute("relation", composition.policy_text.relation_kind),
-                    Attribute("entity_id", composition.sample_counterparty_entity_id),
-                    Attribute("source_entity_id", composition.source_counterparty_entity_id),
+                    Attribute("entity_id", composition.rendered_counterparty_entity_id),
                     Attribute("entity_name", composition.counterparty_canonical_name),
                     Attribute("entity_mention", composition.counterparty_first_mention_name),
                 ),
@@ -319,7 +355,7 @@ def build_acml_document(
             SemanticEntry(
                 kind="belief",
                 attrs=(Attribute("source", "policy_text+runtime"),),
-                content=(SemanticText(composition.belief_text),),
+                content=(SemanticText(composition.belief_entity_registry_text + composition.belief_text),),
             ),
             SemanticEntry(
                 kind="me",
@@ -380,8 +416,7 @@ def validate_acml_sample(
     if observation_attrs.get("relation") != composition.policy_text.relation_kind:
         issues.append(f"unexpected observation relation attr: {observation_attrs.get('relation')!r}")
     expected_observation_attrs = {
-        "entity_id": composition.sample_counterparty_entity_id,
-        "source_entity_id": composition.source_counterparty_entity_id,
+        "entity_id": composition.rendered_counterparty_entity_id,
         "entity_name": composition.counterparty_canonical_name,
         "entity_mention": composition.counterparty_first_mention_name,
     }
@@ -408,7 +443,18 @@ def validate_acml_sample(
     belief_attrs = {attr.name: attr.value for attr in belief.attrs}
     if belief_attrs.get("source") != "policy_text+runtime":
         issues.append(f"unexpected belief source attr: {belief_attrs.get('source')!r}")
-    belief_text = _entry_text_content(belief.content, entry_kind="belief", issues=issues)
+    belief_registry_text, belief_text = _belief_content_parts(belief.content, issues=issues)
+    if belief_registry_text != composition.belief_entity_registry_text:
+        issues.append("belief entity registry text does not match composed registry projection")
+    belief_registry_ids = _parse_belief_registry_entity_ids(
+        belief_registry_text,
+        issues=issues,
+    )
+    if composition.rendered_counterparty_entity_id not in belief_registry_ids:
+        issues.append("belief entity registry does not contain rendered counterparty entity id")
+    observation_entity_id = observation_attrs.get("entity_id")
+    if observation_entity_id and observation_entity_id not in belief_registry_ids:
+        issues.append("observation entity_id does not appear in belief entity registry")
     if not belief_text.strip():
         issues.append("belief entry is empty")
     elif belief_text != composition.belief_text:
@@ -441,18 +487,20 @@ def validate_acml_sample(
                 issues.append(f"unexpected me action tool attr: {action_attrs.get('tool')!r}")
             if action_attrs.get("dialect") != REPLY_TOOL_DIALECT:
                 issues.append(f"unexpected me action dialect attr: {action_attrs.get('dialect')!r}")
-            if action_attrs.get("target_entity_id") != composition.sample_counterparty_entity_id:
+            if action_attrs.get("target_entity_id") != composition.rendered_counterparty_entity_id:
                 issues.append(
                     "unexpected me action target_entity_id attr: "
                     f"{action_attrs.get('target_entity_id')!r}"
                 )
+            elif action_attrs.get("target_entity_id") not in belief_registry_ids:
+                issues.append("me action target_entity_id does not appear in belief entity registry")
             action_text = _action_payload_text(
                 action_node,
                 issues=issues,
                 entry_kind="me",
                 expected_prefix=reply_action_prefix(
                     composition.reply_tool_name,
-                    composition.sample_counterparty_entity_id,
+                    composition.rendered_counterparty_entity_id,
                 ),
                 expected_suffix=reply_action_suffix(),
             )
@@ -486,6 +534,19 @@ def _validate_composition(composition: HelpGateACMLComposition) -> list[str]:
         )
         if composition.sample_counterparty_entity_id != expected_sample_entity_id:
             issues.append("composition sample_counterparty_entity_id is not derived from sample/source entity ids")
+    if not composition.rendered_counterparty_entity_id.strip():
+        issues.append("composition missing rendered_counterparty_entity_id")
+    elif composition.source_counterparty_entity_id.strip():
+        expected_rendered_entity_id = make_rendered_counterparty_entity_id(
+            composition.sample_id,
+            composition.source_counterparty_entity_id,
+        )
+        if composition.rendered_counterparty_entity_id != expected_rendered_entity_id:
+            issues.append(
+                "composition rendered_counterparty_entity_id is not derived from sample/source entity ids"
+            )
+        elif len(composition.rendered_counterparty_entity_id) != 11:
+            issues.append("composition rendered_counterparty_entity_id should be 11 chars")
     if not composition.counterparty_canonical_name.strip():
         issues.append("composition missing counterparty_canonical_name")
     elif composition.counterparty_canonical_name != composition.policy_text.counterparty_canonical_name:
@@ -521,6 +582,14 @@ def _validate_composition(composition: HelpGateACMLComposition) -> list[str]:
     else:
         if composition.belief_text != expected_belief:
             issues.append("composition belief_text does not match policy_text+runtime projection")
+    expected_registry = compose_belief_entity_registry_text(
+        rendered_counterparty_entity_id=composition.rendered_counterparty_entity_id,
+        relation_kind=composition.policy_text.relation_kind,
+        counterparty_canonical_name=composition.counterparty_canonical_name,
+        counterparty_first_mention_name=composition.counterparty_first_mention_name,
+    )
+    if composition.belief_entity_registry_text != expected_registry:
+        issues.append("composition belief_entity_registry_text does not match entity registry projection")
     try:
         expected_wrapper = named_observation_wrapper_for(
             composition.language,
@@ -553,6 +622,59 @@ def _entry_text_content(
             continue
         text_parts.append(item.text)
     return "".join(text_parts)
+
+
+def _belief_content_parts(
+    content: tuple[object, ...],
+    *,
+    issues: list[str],
+) -> tuple[str, str]:
+    belief_text = _entry_text_content(content, entry_kind="belief", issues=issues)
+    if not belief_text:
+        return "", ""
+    prefix = f"{BELIEF_ENTITY_REGISTRY_LABEL}\n"
+    if not belief_text.startswith(prefix):
+        issues.append("belief entry should start with known_people_json registry block")
+        return "", belief_text
+    separator = "\n\n"
+    separator_index = belief_text.find(separator, len(prefix))
+    if separator_index < 0:
+        issues.append("belief entity registry block should be separated from belief text by a blank line")
+        return belief_text, ""
+    registry_text = belief_text[: separator_index + len(separator)]
+    belief_prose = belief_text[separator_index + len(separator) :]
+    return registry_text, belief_prose
+
+
+def _parse_belief_registry_entity_ids(
+    registry_text: str,
+    *,
+    issues: list[str],
+) -> set[str]:
+    prefix = f"{BELIEF_ENTITY_REGISTRY_LABEL}\n"
+    if not registry_text.startswith(prefix):
+        issues.append("belief entity registry text missing known_people_json prefix")
+        return set()
+    registry_json = registry_text[len(prefix):].strip()
+    try:
+        registry = json.loads(registry_json)
+    except json.JSONDecodeError as exc:
+        issues.append(f"belief entity registry is not valid JSON: {exc.msg}")
+        return set()
+    if not isinstance(registry, list):
+        issues.append("belief entity registry should decode to a list")
+        return set()
+    entity_ids: set[str] = set()
+    for item in registry:
+        if not isinstance(item, dict):
+            issues.append("belief entity registry items should be objects")
+            continue
+        entity_id = item.get("entity_id")
+        if not isinstance(entity_id, str) or not entity_id.strip():
+            issues.append("belief entity registry item missing string entity_id")
+            continue
+        entity_ids.add(entity_id)
+    return entity_ids
 
 
 def _entry_me_content(

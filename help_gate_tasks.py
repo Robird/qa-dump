@@ -47,6 +47,7 @@ class HelpGateACMLItem(BaseModel):
     composition_version: str
     source_counterparty_entity_id: str
     sample_counterparty_entity_id: str
+    rendered_counterparty_entity_id: str
     counterparty_canonical_name: str
     counterparty_first_mention_name: str
     reply_tool_name: str
@@ -291,6 +292,7 @@ def _generate_samples(
                 composition_version=HELP_GATE_ACML_COMPOSITION_VERSION,
                 source_counterparty_entity_id=composition.source_counterparty_entity_id,
                 sample_counterparty_entity_id=composition.sample_counterparty_entity_id,
+                rendered_counterparty_entity_id=composition.rendered_counterparty_entity_id,
                 counterparty_canonical_name=composition.counterparty_canonical_name,
                 counterparty_first_mention_name=composition.counterparty_first_mention_name,
                 reply_tool_name=composition.reply_tool_name,
